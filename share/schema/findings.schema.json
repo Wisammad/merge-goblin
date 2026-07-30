@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bob findings",
+  "description": "The complete output of a code review. The reviewer returns this object and posts nothing itself.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1], "default": 1 },
+    "summary": {
+      "type": "string",
+      "description": "2-5 sentences: what the PR does and the overall read. Markdown. Follows the repo's writing style."
+    },
+    "suggested_verdict": {
+      "type": "string",
+      "enum": ["approve", "comment", "request_changes"],
+      "description": "Advisory only — the engine decides the actual verdict."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Concrete, actionable findings. Omit cosmetic nitpicks unless they violate a required repo standard.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "body"],
+        "properties": {
+          "path": { "type": "string", "description": "Repo-relative path of the changed file. Omit only for repo-wide findings." },
+          "line": { "type": "integer", "description": "Line number in the NEW file (or old file when side is LEFT). For a range, the LAST line." },
+          "start_line": { "type": "integer", "description": "First line of a multi-line range. Omit for single-line." },
+          "side": { "type": "string", "enum": ["RIGHT", "LEFT"], "default": "RIGHT", "description": "RIGHT = added/context line, LEFT = removed line." },
+          "start_side": { "type": "string", "enum": ["RIGHT", "LEFT"] },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "convention", "risk", "nit", "question"],
+            "description": "blocker = bug/regression or a rule the repo says to block on; convention = violates a required repo standard; risk = plausible problem worth confirming; nit = minor; question = needs author input."
+          },
+          "title": { "type": "string", "description": "Short imperative summary, under ~80 chars." },
+          "body": { "type": "string", "description": "The comment. Explain the problem and the fix. Markdown." },
+          "suggestion": { "type": "string", "description": "Optional replacement code for exactly the commented line range. Omit unless it applies cleanly." }
+        }
+      }
+    },
+    "intent_note": {
+      "type": ["object", "null"],
+      "description": "Does the PR do what its linked issue asked? Null when there is no linked issue.",
+      "additionalProperties": false,
+      "required": ["verdict", "body"],
+      "properties": {
+        "issue": { "type": "string", "description": "Issue key, e.g. CORE-2727." },
+        "verdict": { "type": "string", "enum": ["fulfils", "partial", "diverges", "unknown", "no_ticket"] },
+        "body": { "type": "string", "description": "Markdown: what the issue asked, what the PR does, and any gaps." }
+      }
+    }
+  }
+}

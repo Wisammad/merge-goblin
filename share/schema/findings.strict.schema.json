@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bob findings (strict)",
+  "description": "Same contract as findings.schema.json, in OpenAI structured-output dialect: every property must appear in `required`, so optional fields are expressed as nullable unions instead. Used by providers that enforce that dialect (codex).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "summary", "suggested_verdict", "findings", "intent_note"],
+  "properties": {
+    "schema_version": { "type": "integer" },
+    "summary": { "type": "string" },
+    "suggested_verdict": { "type": "string", "enum": ["approve", "comment", "request_changes"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line", "start_line", "side", "start_side", "severity", "title", "body", "suggestion"],
+        "properties": {
+          "path": { "type": ["string", "null"] },
+          "line": { "type": ["integer", "null"] },
+          "start_line": { "type": ["integer", "null"] },
+          "side": { "type": ["string", "null"], "enum": ["RIGHT", "LEFT", null] },
+          "start_side": { "type": ["string", "null"], "enum": ["RIGHT", "LEFT", null] },
+          "severity": { "type": "string", "enum": ["blocker", "convention", "risk", "nit", "question"] },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "suggestion": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "intent_note": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["issue", "verdict", "body"],
+      "properties": {
+        "issue": { "type": ["string", "null"] },
+        "verdict": { "type": "string", "enum": ["fulfils", "partial", "diverges", "unknown", "no_ticket"] },
+        "body": { "type": "string" }
+      }
+    }
+  }
+}

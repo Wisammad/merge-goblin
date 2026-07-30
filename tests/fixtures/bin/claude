@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake `claude` for tests and CI: enough of the real interface that install.sh
+# and the probe path work, without a subscription, a network call or any cost.
+case "${1:-}" in
+  --version)   echo "0.0.0-fake (bob test fixture)" ;;
+  auth)        echo '{"loggedIn":true,"authMethod":"fake","subscriptionType":"test"}' ;;
+  -p|--print)
+    # Return a minimal valid findings object so the contract can be exercised.
+    cat <<'JSON'
+{"type":"result","is_error":false,"num_turns":1,"total_cost_usd":0,
+ "usage":{"input_tokens":0,"output_tokens":0},
+ "structured_output":{"schema_version":1,"summary":"fake reviewer","suggested_verdict":"comment","findings":[],"intent_note":null},
+ "result":"{\"schema_version\":1,\"summary\":\"fake reviewer\",\"suggested_verdict\":\"comment\",\"findings\":[],\"intent_note\":null}"}
+JSON
+    ;;
+  *) echo "fake claude: ${*}" >&2 ;;
+esac
+exit 0

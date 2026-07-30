@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="The Merge Goblin">
+  <!-- A small goblin holding a green merge button. -->
+  <defs>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7cc36a"/>
+      <stop offset="1" stop-color="#4a8f3c"/>
+    </linearGradient>
+    <linearGradient id="btn" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4ee88a"/>
+      <stop offset="1" stop-color="#16a34a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ears -->
+  <path d="M14 26 L2 16 q6 12 8 15 z" fill="url(#skin)"/>
+  <path d="M50 26 L62 16 q-6 12 -8 15 z" fill="url(#skin)"/>
+
+  <!-- hood -->
+  <path d="M12 25 q20 -19 40 0 l-3 5 q-17 -13 -34 0 z" fill="#3b2a52"/>
+
+  <!-- head -->
+  <path d="M14 27 q18 -10 36 0 q2 18 -8 25 q-10 7 -20 0 q-10 -7 -8 -25 z" fill="url(#skin)"/>
+
+  <!-- brow + eyes -->
+  <path d="M20 33 l9 3 -9 2 z" fill="#2f5d25"/>
+  <path d="M44 33 l-9 3 9 2 z" fill="#2f5d25"/>
+  <circle cx="25" cy="39" r="3.2" fill="#fffbe6"/>
+  <circle cx="39" cy="39" r="3.2" fill="#fffbe6"/>
+  <circle cx="25.8" cy="39.4" r="1.7" fill="#1a1a1a"/>
+  <circle cx="39.8" cy="39.4" r="1.7" fill="#1a1a1a"/>
+
+  <!-- nose + grin with one tooth -->
+  <path d="M32 41 l3 6 -6 0 z" fill="#3f7a33"/>
+  <path d="M24 48 q8 6 16 0 q-8 3 -16 0 z" fill="#24401d"/>
+  <path d="M35 49 l2 4 -3 -1 z" fill="#fffbe6"/>
+
+  <!-- hands + the merge button it is guarding -->
+  <rect x="16" y="53" width="32" height="10" rx="5" fill="url(#btn)"/>
+  <path d="M25 58 h6 m0 0 l-2 -2 m2 2 l-2 2" stroke="#0b3d20" stroke-width="1.6"
+        fill="none" stroke-linecap="round"/>
+  <circle cx="37" cy="58" r="2.4" fill="none" stroke="#0b3d20" stroke-width="1.6"/>
+  <circle cx="14" cy="56" r="4" fill="url(#skin)"/>
+  <circle cx="50" cy="56" r="4" fill="url(#skin)"/>
+</svg>

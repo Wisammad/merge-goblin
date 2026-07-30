@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install shellcheck
+        run: brew install shellcheck
+
+      - name: shellcheck
+        # SC2034 (unused variable) is excluded: this is a sourced-library layout,
+        # so constants defined in brand.sh/paths.sh are used by other files that
+        # shellcheck analyses separately. Everything else stays on.
+        run: |
+          shellcheck -s bash -S warning -x --exclude=SC2034 \
+            bin/goblin lib/*.sh lib/providers/*.sh install.sh uninstall.sh tests/run.sh
+
+      - name: reject bash 4+ syntax
+        # The plist runs /bin/bash, which is 3.2 on macOS — CI's bash is newer
+        # and would happily accept syntax that fails on a real machine.
+        run: |
+          if grep -rnE 'declare -A|mapfile|readarray|\$\{[A-Za-z_]+,,\}|\$\{[A-Za-z_]+\^\^\}' \
+               bin lib install.sh uninstall.sh | grep -vE ':[0-9]+: *#'; then
+            echo "bash 4+ syntax found — must run on bash 3.2"; exit 1
+          fi
+
+      - name: jq programs compile
+        run: |
+          for f in share/jq/*.jq templates/*.jq; do
+            jq -n -f "$f" >/dev/null 2>&1 || rc=$?
+            if [ "${rc:-0}" -gt 5 ]; then echo "compile error in $f"; exit 1; fi
+            unset rc
+          done
+
+      - name: schemas parse
+        run: for f in share/schema/*.json; do jq -e . "$f" >/dev/null; done
+
+      - name: tests
+        run: ./tests/run.sh
+
+      - name: install smoke test
+        # Runs install.sh unmodified. The runner has no AI CLI and no interactive
+        # gh login, so a stub provider goes on PATH and the built-in token
+        # satisfies `gh auth status`.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x tests/fixtures/bin/*
+          export PATH="$PWD/tests/fixtures/bin:$PATH"
+          ./install.sh --non-interactive --no-agent --no-menu --home "$RUNNER_TEMP/goblinhome"
+          test -x "$RUNNER_TEMP/goblinhome/app/bin/goblin"
+          GOBLIN_HOME="$RUNNER_TEMP/goblinhome" "$RUNNER_TEMP/goblinhome/app/bin/goblin" version
+          # re-running must be a no-op (this is also the upgrade path)
+          cp "$RUNNER_TEMP/goblinhome/config.json" "$RUNNER_TEMP/cfg1.json"
+          ./install.sh --non-interactive --no-agent --no-menu --home "$RUNNER_TEMP/goblinhome"
+          diff "$RUNNER_TEMP/cfg1.json" "$RUNNER_TEMP/goblinhome/config.json"

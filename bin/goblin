@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+#   The Merge Goblin — he guards the merge button.
+#
+# Watches for pull requests that request YOUR review, reviews them with whichever
+# AI CLI you're signed into (Claude / Codex / Cursor), and posts one grouped
+# review with line-anchored comments — clearly labelled as automated.
+#
+#   goblin ui              open the control panel
+#   goblin doctor          check everything and print fixes
+#   goblin run --pr 123    review one PR now
+#   goblin run --plan      dry run: show what it would post, post nothing
+#   goblin off / on        master switch (survives reboot)
+#
+# See `goblin help` for the full surface.
+
+set -uo pipefail
+
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _link="$(readlink "$_self")"
+  case "$_link" in
+    /*) _self="$_link" ;;
+    *)  _self="$(cd "$(dirname "$_self")" && pwd)/$_link" ;;
+  esac
+done
+GOBLIN_APP="${GOBLIN_APP:-$(cd "$(dirname "$_self")/.." && pwd)}"
+
+# shellcheck source=lib/brand.sh
+. "$GOBLIN_APP/lib/brand.sh"
+# shellcheck source=lib/paths.sh
+. "$GOBLIN_APP/lib/paths.sh"
+# shellcheck source=lib/core.sh
+. "$GOBLIN_APP/lib/core.sh"
+# shellcheck source=lib/config.sh
+. "$GOBLIN_APP/lib/config.sh"
+# shellcheck source=lib/agent.sh
+. "$GOBLIN_APP/lib/agent.sh"
+# shellcheck source=lib/state.sh
+. "$GOBLIN_APP/lib/state.sh"
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "$GOBLIN_SLUG: missing dependency '$1'" >&2; exit 1; }; }
+need jq
+
+usage() {
+  cat <<EOF
+$GOBLIN_EMOJI $GOBLIN_NAME v$GOBLIN_VERSION — $GOBLIN_TAGLINE
+
+  goblin ui                        open the control panel (everything is here)
+  goblin status [--json]              current state, stats and spend
+  goblin doctor [--fix] [--json]      diagnose everything; --fix repairs the safe ones
+  goblin run [--pr N] [--repo SLUG]   review now
+          [--plan] [--force]       --plan = dry run (posts nothing)
+  goblin on | off                     master switch (off survives reboot)
+  goblin pause | resume | toggle      temporary stop (agent stays scheduled)
+  goblin snooze 1h|tomorrow|<secs>|clear
+  goblin budget [show|off|<usd>]      daily spend cap
+  goblin repos [list|add SLUG|rm SLUG|enable SLUG|disable SLUG]
+  goblin provider [list|use <id>|which]
+  goblin fleet [list|add LOGIN|rm LOGIN]   teammates also running the $GOBLIN_SHORT
+  goblin config [get <path>|set <path> <value>|edit|path]
+  goblin log [-f] [-n N]              tail the log
+  goblin agent [status|start|stop|reload|label]
+  goblin migrate [--from DIR]         import state from the old prauto/conductor setup
+  goblin version | help
+EOF
+}
+
+cmd="${1:-status}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  status)   . "$LIB_DIR/cmd_status.sh";  cmd_status "$@" ;;
+  doctor)   . "$LIB_DIR/doctor.sh";      cmd_doctor "$@" ;;
+  run)      . "$LIB_DIR/engine.sh";      cmd_run "$@" ;;
+  migrate)  . "$LIB_DIR/migrate.sh";     cmd_migrate "$@" ;;
+  ui|panel|open) . "$LIB_DIR/ui.sh";    cmd_ui "$@" ;;
+  version)  echo "$GOBLIN_NAME $GOBLIN_VERSION" ;;
+  help|-h|--help) usage ;;
+  # everything else is a small control verb
+  on|off|pause|resume|toggle|toggle-power|snooze|budget|repos|provider|fleet|config|log|agent|fix-account|\
+  run-now|snooze1h|snoozetomorrow|clearsnooze|budgetoff|budget2|budget5|budget10|set-budget|disable-agent|enable-agent)
+            . "$LIB_DIR/cmd_ctl.sh";     cmd_ctl "$cmd" "$@" ;;
+  *)        echo "$GOBLIN_SLUG: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+esac
