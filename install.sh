@@ -145,9 +145,14 @@ if [ "$WITH_AGENT" = true ]; then
       -e "s|__INTERVAL__|$INTERVAL|g" \
       "$APP/templates/launchd.plist.tmpl" > "$AGENT_PLIST"
   if plutil -lint "$AGENT_PLIST" >/dev/null 2>&1; then
+    # agent_on retries through the asynchronous bootout (see lib/agent.sh); check
+    # the real state afterwards rather than trusting either call.
     agent_stop; agent_on
     if agent_running; then ok "scheduled every ${INTERVAL}s ($AGENT_LABEL)"
-    else warn "plist written but the agent didn't load — run: $GOBLIN_SLUG agent start"; fi
+    else
+      err "the scheduler did not load — nothing will be reviewed until it does"
+      say "        try:  $GOBLIN_SLUG agent start     then:  $GOBLIN_SLUG doctor"
+    fi
   else
     err "generated plist is invalid: $AGENT_PLIST"
   fi

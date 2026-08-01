@@ -18,6 +18,22 @@ case "${1:-}" in
       printf '\t"%s" => disabled\n' "${LC_FAKE_LABEL:-com.test.goblin}"
     fi
     exit 0 ;;
-  bootstrap|bootout|enable|disable|kickstart) exit 0 ;;
+  bootstrap)
+    # LC_FAKE_BOOTSTRAP_FAILS=<n>: fail the first n bootstraps with the real
+    # "Bootstrap failed: 5: Input/output error" that launchd returns while a
+    # bootout is still tearing the job down. Counted in a file because each
+    # invocation is a separate process.
+    if [ -n "${LC_FAKE_BOOTSTRAP_FAILS:-}" ] && [ -n "${LC_FAKE_COUNT_FILE:-}" ]; then
+      # An empty file reads as "" from cat, not 0, and `[ "" -lt 3 ]` is an error
+      # rather than true — which silently made the very first bootstrap succeed.
+      n="$(cat "$LC_FAKE_COUNT_FILE" 2>/dev/null)"; n="${n:-0}"
+      if [ "$n" -lt "$LC_FAKE_BOOTSTRAP_FAILS" ]; then
+        printf '%s\n' "$((n + 1))" > "$LC_FAKE_COUNT_FILE"
+        echo "Bootstrap failed: 5: Input/output error" >&2
+        exit 5
+      fi
+    fi
+    exit 0 ;;
+  bootout|enable|disable|kickstart) exit 0 ;;
   *) exit 0 ;;
 esac

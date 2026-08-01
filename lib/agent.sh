@@ -18,9 +18,31 @@ agent_disabled() {
     | grep -qE "\"${AGENT_LABEL}\"[[:space:]]*=>[[:space:]]*disabled"
 }
 
+# Returns non-zero if the job is not loaded when this returns, so callers can say
+# so instead of reporting a success that did not happen.
+#
+# `launchctl bootout` is ASYNCHRONOUS: it returns 0 while the job is still being
+# torn down, and a `bootstrap` that lands in that window fails with
+#
+#     Bootstrap failed: 5: Input/output error
+#
+# install.sh does stop-then-start on every re-run — which is the documented upgrade
+# path — so this raced every single time, and because the error was swallowed with
+# `|| true` the installer went on to report the scheduler as installed while the
+# machine had no scheduler at all. Reviews then silently stopped until someone
+# noticed and ran `goblin agent start` by hand. Retry until the old job is really
+# gone rather than guessing at a sleep.
 agent_start() {
-  launchctl enable "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" 2>/dev/null || true
+  local uid i=0; uid="$(id -u)"
+  launchctl enable "gui/$uid/${AGENT_LABEL}" 2>/dev/null || true
+  while [ "$i" -lt 25 ]; do
+    launchctl bootstrap "gui/$uid" "$AGENT_PLIST" 2>/dev/null && return 0
+    # Already loaded is a success, not a failure: bootstrap refuses a label that is
+    # present, and a caller asking for "started" wants exactly that state.
+    agent_running && return 0
+    sleep 0.2; i=$((i + 1))
+  done
+  return 1
 }
 
 agent_stop() {
@@ -30,7 +52,9 @@ agent_stop() {
 
 agent_off() { agent_stop; launchctl disable "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true; }
 agent_on()  { launchctl enable "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true; agent_start; }
-agent_reload() { agent_stop; sleep 1; agent_start; }
+# No sleep here any more: agent_start waits for the bootout to finish and retries,
+# which is both more reliable than one second and faster when the job is already gone.
+agent_reload() { agent_stop; agent_start; }
 
 # --- github identity ------------------------------------------------------
 

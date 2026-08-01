@@ -784,6 +784,38 @@ test_stale_failures_do_not_mark_the_icon_broken() {
   teardown
 }
 
+
+test_agent_start_survives_the_bootout_race() {
+  setup
+  AGENT_PLIST="$GOBLIN_HOME/test.plist"; : > "$AGENT_PLIST"
+  LC_FAKE_COUNT_FILE="$GOBLIN_HOME/bootstraps"; export LC_FAKE_COUNT_FILE
+  : > "$LC_FAKE_COUNT_FILE"
+  unset LC_FAKE_RUNNING
+
+  # launchctl bootout is asynchronous, so a bootstrap landing in that window fails
+  # with "Bootstrap failed: 5: Input/output error". install.sh does stop-then-start
+  # on every re-run, the error was swallowed with `|| true`, and the installer then
+  # reported the scheduler installed on a machine that had none — reviews stopped
+  # silently until someone ran `goblin agent start` by hand. Reproduced live before
+  # this fix; asserted here so it cannot come back.
+  LC_FAKE_BOOTSTRAP_FAILS=3; export LC_FAKE_BOOTSTRAP_FAILS
+  agent_start || { echo "agent_start gave up while the old job was still going away"; return 1; }
+  [ "$(cat "$LC_FAKE_COUNT_FILE")" = "3" ] || { echo "expected 3 failed attempts before success"; return 1; }
+
+  # And it must report failure rather than claim success when the job never loads.
+  : > "$LC_FAKE_COUNT_FILE"
+  LC_FAKE_BOOTSTRAP_FAILS=9999
+  if agent_start; then echo "agent_start reported success with nothing loaded"; return 1; fi
+
+  # ...unless the job is already loaded, which bootstrap refuses but a caller
+  # asking for "started" should read as done.
+  : > "$LC_FAKE_COUNT_FILE"
+  LC_FAKE_RUNNING=1; export LC_FAKE_RUNNING
+  agent_start || { echo "already-loaded must count as started"; return 1; }
+  unset LC_FAKE_RUNNING LC_FAKE_BOOTSTRAP_FAILS LC_FAKE_COUNT_FILE
+  teardown
+}
+
 # ------------------------------------------------- menu bar app / panel ---
 _entry() { # _entry <pr> <head> <draft> <author> [requested-logins...]
   local pr="$1" head="$2" draft="$3" author="$4"; shift 4
@@ -1191,6 +1223,7 @@ t "inbox: counts and shape"              test_inbox_counts_and_shape
 t "inbox: hides everything not waiting"  test_inbox_hides_everything_not_waiting
 t "inbox: human reviewer detection"      test_human_reviewer_detection
 t "inbox: own review counts as human"    test_our_own_manual_review_counts_as_human
+t "agent: start survives bootout race" test_agent_start_survives_the_bootout_race
 t "bar: stale failures are not faults" test_stale_failures_do_not_mark_the_icon_broken
 t "bar: glyph decision table"            test_bar_glyph_decision_table
 t "panel: contract matches the app"      test_panel_contract_matches_the_app
