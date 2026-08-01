@@ -77,9 +77,16 @@ DEFAULT_PROVIDER="$(printf '%s' "$found" | awk '{print $1}')"
 # --- 3. copy the app ------------------------------------------------------
 say ""; say "installing"
 mkdir -p "$GOBLIN_HOME" "$APP" || { err "cannot create $GOBLIN_HOME"; exit 1; }
+# app/ and app-tests/ come too: `goblin app rebuild` has to work from the INSTALLED
+# copy, because the clone may be in ~/Documents where launchd cannot read it — and
+# the whole reason the runtime lives here is that TCC restriction. Without the
+# sources, app_build silently skipped and the installer reported success while
+# installing no app at all.
 # ${APP:?} so an empty APP can never turn this into `rm -rf /lib`.
-rm -rf "${APP:?}/lib" "${APP:?}/bin" "${APP:?}/share" "${APP:?}/templates"
-cp -R "$SRC/lib" "$SRC/bin" "$SRC/share" "$SRC/templates" "$APP/" 2>/dev/null
+rm -rf "${APP:?}/lib" "${APP:?}/bin" "${APP:?}/share" "${APP:?}/templates" \
+       "${APP:?}/app" "${APP:?}/app-tests"
+cp -R "$SRC/lib" "$SRC/bin" "$SRC/share" "$SRC/templates" \
+      "$SRC/app" "$SRC/app-tests" "$APP/" 2>/dev/null
 chmod +x "$APP/bin/$GOBLIN_SLUG"
 ok "app  → $APP"
 
@@ -146,42 +153,27 @@ if [ "$WITH_AGENT" = true ]; then
   fi
 fi
 
-# --- 7. control panel -----------------------------------------------------
-# A tiny .app whose only job is to launch `$GOBLIN_SLUG ui`, so the panel is in Spotlight
-# and the Dock like any other app. It's a script bundle built locally, so there
-# is nothing to sign, notarise or approve in Gatekeeper.
+# --- 7. menu bar app ------------------------------------------------------
+# Built here rather than shipped: the app is ad-hoc signed on the machine it runs
+# on, so there is nothing to notarise and no Gatekeeper prompt. app_build stages
+# into $GOBLIN_HOME/build and swaps the finished bundle into place, so a running
+# app is never modified underneath itself.
+#
+# It REPLACES the bundle rather than writing into it. The previous version of this
+# step wrote a plist and a launcher script into whatever already existed at that
+# path, which meant an older bundle survived in pieces: the 0.3.x app kept its
+# compiled binary while losing the GBLCLIPath key that tells it where the CLI is,
+# and every action in the panel then failed with "the Merge Goblin CLI path is
+# missing from the app bundle". A bundle is replaced whole or not at all.
 if [ "$WITH_MENU" = true ]; then
-  say ""; say "control panel"
-  APPDIR="$HOME/Applications/$GOBLIN_SHORT.app"
-  mkdir -p "$APPDIR/Contents/MacOS" "$APPDIR/Contents/Resources"
-  cp "$APP/share/ui/goblin.icns" "$APPDIR/Contents/Resources/goblin.icns" 2>/dev/null
-  cat > "$APPDIR/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>$GOBLIN_NAME</string>
-  <key>CFBundleDisplayName</key><string>$GOBLIN_NAME</string>
-  <key>CFBundleIdentifier</key><string>com.$(id -un | tr -cd '[:alnum:]').$GOBLIN_SLUG</string>
-  <key>CFBundleVersion</key><string>$GOBLIN_VERSION</string>
-  <key>CFBundleShortVersionString</key><string>$GOBLIN_VERSION</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleExecutable</key><string>$GOBLIN_SLUG-panel</string>
-  <key>CFBundleIconFile</key><string>goblin</string>
-</dict>
-</plist>
-PLIST
-  cat > "$APPDIR/Contents/MacOS/$GOBLIN_SLUG-panel" <<LAUNCH
-#!/bin/bash
-# Opens the control panel in your browser and keeps serving it until this app is
-# quit. Running it twice just re-opens the tab rather than starting a second one.
-export GOBLIN_HOME="$GOBLIN_HOME"
-exec "$APP/bin/$GOBLIN_SLUG" ui
-LAUNCH
-  chmod +x "$APPDIR/Contents/MacOS/$GOBLIN_SLUG-panel"
-  ok "app  → $APPDIR"
-  say  "        double-click it, or run: $GOBLIN_SLUG ui"
-  say  "        (quit the app, or '$GOBLIN_SLUG ui --stop', to shut the panel down)"
+  say ""; say "menu bar app"
+  # shellcheck source=lib/app.sh
+  . "$APP/lib/app.sh"
+  if app_install; then
+    ok "app  → $APP_BUNDLE"
+  else
+    warn "the menu bar app did not build — the CLI and 'goblin ui' work without it"
+  fi
 fi
 
 # --- 8. checkup -----------------------------------------------------------

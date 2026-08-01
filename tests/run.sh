@@ -33,9 +33,14 @@ eq() { # eq <expected> <actual> [label]
 setup() {
   GOBLIN_HOME="$(mktemp -d)"; export GOBLIN_HOME
   export GOBLIN_APP="$ROOT"
-  export PATH="$ROOT/tests/fixtures/bin:$PATH"
   # shellcheck source=/dev/null
-  for f in brand paths core config state agent; do . "$ROOT/lib/$f.sh"; done
+  for f in brand paths core config state agent attempts inbox; do . "$ROOT/lib/$f.sh"; done
+  # AFTER sourcing, deliberately: core.sh widens PATH with /opt/homebrew, /usr/bin
+  # and /bin IN FRONT, which shadowed every stub whose real counterpart exists on
+  # this machine — launchctl, gh, osascript. The fixtures were on PATH but never
+  # winning, so anything that shelled out was silently reading the real machine and
+  # passing or failing by accident. Prepending here is what makes them authoritative.
+  export PATH="$ROOT/tests/fixtures/bin:$PATH"
   cfg_ensure
 }
 teardown() { [ -n "${GOBLIN_HOME:-}" ] && [ -d "$GOBLIN_HOME" ] && rm -rf "$GOBLIN_HOME"; }
@@ -750,6 +755,390 @@ PY
   teardown
 }
 
+test_stale_failures_do_not_mark_the_icon_broken() {
+  setup
+  . "$ROOT/lib/inbox.sh"; . "$ROOT/lib/attempts.sh"
+  local now old; now="$(now_epoch)"; old=$((now - 300000))   # ~3.5 days ago
+
+  # Three failures from days ago, two of which the same PR later recovered from.
+  # This is what every long-lived install looks like, and an unbounded "last 3
+  # failures ever" turned it into a permanently red menu bar icon.
+  jq -nc --argjson at "$old" '{at:$at,number:11,title:"a",url:"u",costUsd:0,status:"failed",reason:"transient",repo:"o/r"}' >> "$EVENTS"
+  jq -nc --argjson at "$old" '{at:$at,number:12,title:"b",url:"u",costUsd:0,status:"failed",reason:"auth",repo:"o/r"}'      >> "$EVENTS"
+  jq -nc --argjson at "$((old + 10))" '{at:$at,number:12,title:"b",url:"u",costUsd:0,status:"posted",reason:"",repo:"o/r"}' >> "$EVENTS"
+  eq "0" "$(compute_stats | jq -r '.recentFailures | length')" || return 1
+
+  # A failure inside the window that has NOT recovered is a real fault and must
+  # still be reported — the bound must not silence everything.
+  jq -nc --argjson at "$now" '{at:$at,number:21,title:"c",url:"u",costUsd:0,status:"failed",reason:"other",repo:"o/r"}' >> "$EVENTS"
+  eq "1" "$(compute_stats | jq -r '.recentFailures | length')" || return 1
+
+  # ...but not once the next poll succeeds on that same PR.
+  jq -nc --argjson at "$((now + 1))" '{at:$at,number:21,title:"c",url:"u",costUsd:0,status:"posted",reason:"",repo:"o/r"}' >> "$EVENTS"
+  eq "0" "$(compute_stats | jq -r '.recentFailures | length')" || return 1
+
+  # Same PR number in a DIFFERENT repo must not launder a failure away.
+  jq -nc --argjson at "$now" '{at:$at,number:31,title:"d",url:"u",costUsd:0,status:"failed",reason:"other",repo:"o/r"}'     >> "$EVENTS"
+  jq -nc --argjson at "$((now + 1))" '{at:$at,number:31,title:"d",url:"u",costUsd:0,status:"posted",reason:"",repo:"other/repo"}' >> "$EVENTS"
+  eq "1" "$(compute_stats | jq -r '.recentFailures | length')" || return 1
+  teardown
+}
+
+# ------------------------------------------------- menu bar app / panel ---
+_entry() { # _entry <pr> <head> <draft> <author> [requested-logins...]
+  local pr="$1" head="$2" draft="$3" author="$4"; shift 4
+  local reqs="[]" l
+  for l in "$@"; do
+    reqs="$(printf '%s' "$reqs" | jq -c --arg k "$l" '. + [{kind:"user", key:$k}]')"
+  done
+  jq -nc --argjson pr "$pr" --arg h "$head" --argjson d "$draft" --arg a "$author" \
+    --argjson r "$reqs" \
+    '{number:$pr, head:$h, draft:$d, title:"t", url:"u", base:"main", author:$a,
+      updatedAt:0, requested:$r}'
+}
+
+# Ported from feat/menu-bar-app alongside the app layer they cover. The glyph
+# and panel-contract tests are the point of putting that logic in bash: the icon
+# and the settings channel are asserted here rather than in untested Swift.
+test_bar_glyph_decision_table() {
+  setup
+  . "$ROOT/lib/inbox.sh"; . "$ROOT/lib/attempts.sh"
+  # Fully hermetic: HOME is sandboxed so gh_active_account reads a hosts.yml we
+  # control, and launchctl is stubbed so agent state is ours to set. Without this
+  # the test reads the developer machine and passes or fails by accident.
+  local real_home="$HOME"
+  HOME="$GOBLIN_HOME/home"; export HOME
+  mkdir -p "$HOME/.config/gh" "$HOME/Library/LaunchAgents"
+  printf 'github.com:\n    user: me\n' > "$HOME/.config/gh/hosts.yml"
+  AGENT_PLIST="$HOME/Library/LaunchAgents/test.plist"
+  : > "$AGENT_PLIST"                       # a schedule IS installed
+  LC_FAKE_RUNNING=1; export LC_FAKE_RUNNING
+  unset LC_FAKE_DISABLED
+  cfg_set --arg l me '.identity.githubLogin = $l | .setupComplete = true'
+
+  _glyph() { ui_state_write; jq -r '.bar.glyph' "$UISTATE"; }
+  _fin() { HOME="$real_home"; export HOME; unset LC_FAKE_RUNNING LC_FAKE_DISABLED; }
+
+  # A deliberate pause must NEVER read as a fault. Conflating "you turned it off"
+  # with "something is broken" is the fastest way to teach someone to ignore the
+  # icon, at which point it protects nobody.
+  status_set '{"state":"idle","pausedReason":"","doctor":{"fail":0,"warn":0,"at":0}}'
+  eq "idle"      "$(_glyph)" || { _fin; return 1; }
+  status_set '{"state":"reviewing"}'
+  eq "reviewing" "$(_glyph)" || { _fin; return 1; }
+  status_set '{"state":"snoozed","pausedReason":"snoozed"}'
+  eq "snoozed"   "$(_glyph)" || { _fin; return 1; }
+  status_set '{"state":"paused","pausedReason":"quota"}'
+  eq "quota"     "$(_glyph)" || { _fin; return 1; }
+  status_set '{"state":"paused","pausedReason":"manual"}'
+  eq "paused"    "$(_glyph)" || { _fin; return 1; }
+
+  # genuinely broken -> error
+  status_set '{"state":"idle","pausedReason":"","doctor":{"fail":2,"warn":0,"at":0}}'
+  eq "error" "$(_glyph)" || { _fin; return 1; }
+  status_set '{"doctor":{"fail":0,"warn":0,"at":0}}'
+  eq "idle"  "$(_glyph)" || { _fin; return 1; }
+
+  # A wrong GitHub account is the failure that has actually bitten this tool three
+  # times, and jq `//` silently swallowed it once (see the note in state.sh).
+  cfg_set --arg l somebodyelse '.identity.githubLogin = $l'
+  eq "error" "$(_glyph)" || { _fin; return 1; }
+  cfg_set --arg l me '.identity.githubLogin = $l'
+  eq "idle"  "$(_glyph)" || { _fin; return 1; }
+
+  # scheduled but not loaded = reviews have silently stopped
+  unset LC_FAKE_RUNNING
+  eq "error" "$(_glyph)" || { _fin; return 1; }
+  # but a machine where no schedule was ever installed is not a fault
+  rm -f "$AGENT_PLIST"
+  eq "idle"  "$(_glyph)" || { _fin; return 1; }
+  LC_FAKE_RUNNING=1; export LC_FAKE_RUNNING; : > "$AGENT_PLIST"
+
+  cfg_set '.enabled = false'
+  eq "off"   "$(_glyph)" || { _fin; return 1; }
+  cfg_set '.enabled = true'
+  cfg_set '.setupComplete = false'
+  eq "error" "$(_glyph)" || { _fin; return 1; }
+  _fin
+  teardown
+}
+
+test_inbox_classifier() {
+  setup
+  . "$ROOT/lib/attempts.sh"; . "$ROOT/lib/inbox.sh"
+  GOBLIN_LOGIN=me
+
+  # ours and not yet done
+  eq "waiting" "$(inbox_classify "$(_entry 1 aaa false someoneelse me)" me "me" me | jq -r '.state')" || return 1
+  # a draft is never counted, even when assigned to us
+  eq "draft"   "$(inbox_classify "$(_entry 2 bbb true someoneelse me)" me "me" me | jq -r '.state')" || return 1
+  # nobody in the live fleet was asked
+  eq "not_ours" "$(inbox_classify "$(_entry 3 ccc false someoneelse)" me "" "" | jq -r '.state')" || return 1
+  # already in our ledger at THIS commit
+  ledger_add "4:ddd"
+  eq "reviewed" "$(inbox_classify "$(_entry 4 ddd false someoneelse me)" me "me" me | jq -r '.state')" || return 1
+  # ...but a new commit on the same PR is waiting again
+  eq "waiting"  "$(inbox_classify "$(_entry 4 eee false someoneelse me)" me "me" me | jq -r '.state')" || return 1
+  # a live teammate owns it
+  local row; row="$(inbox_classify "$(_entry 5 fff false someoneelse me alice)" me "me
+alice" alice)"
+  eq "assigned_elsewhere" "$(printf '%s' "$row" | jq -r '.state')" || return 1
+  eq "false"              "$(printf '%s' "$row" | jq -r '.mine')"  || return 1
+  teardown
+}
+
+test_inbox_counts_and_shape() {
+  setup
+  . "$ROOT/lib/attempts.sh"; . "$ROOT/lib/inbox.sh"
+  GOBLIN_LOGIN=me; INBOX_REPO=o/n
+  local rows="$GOBLIN_HOME/rows"
+  { inbox_classify "$(_entry 1 a false other me)"  me "me" me
+    inbox_classify "$(_entry 2 b false other me)"  me "me" me
+    inbox_classify "$(_entry 3 c true  other me)"  me "me" me
+    inbox_classify "$(_entry 4 d false other)"     me ""   ""
+    inbox_classify "$(_entry 5 e false other me alice)" me "me
+alice" alice
+  } > "$rows"
+  inbox_write "$rows"
+
+  jq -e . "$INBOX" >/dev/null || { echo "inbox.json is not valid json"; return 1; }
+  eq "2" "$(jq -r '.counts.waiting' "$INBOX")" || return 1
+  eq "2" "$(jq -r '.counts.mine' "$INBOX")"    || return 1
+  eq "1" "$(jq -r '.counts.drafts' "$INBOX")"  || return 1
+  eq "1" "$(jq -r '.counts.assignedElsewhere' "$INBOX")" || return 1
+  # waiting must equal the number of rows in that state — a count that disagrees
+  # with the list is worse than no count, because it looks authoritative
+  eq "$(jq -r '.counts.waiting' "$INBOX")" "$(jq -r '[.prs[] | select(.state=="waiting")] | length' "$INBOX")" || return 1
+  # not_ours rows are excluded from the visible list
+  eq "0" "$(jq -r '[.prs[] | select(.state=="not_ours")] | length' "$INBOX")" || return 1
+  # and the bar reads it
+  ui_state_write
+  eq "2" "$(jq -r '.inbox.waiting' "$UISTATE")" || return 1
+  eq "2" "$(jq -r '.bar.count' "$UISTATE")"     || return 1
+  teardown
+}
+
+test_inbox_hides_everything_not_waiting() {
+  setup
+  . "$ROOT/lib/attempts.sh"; . "$ROOT/lib/inbox.sh"
+  GOBLIN_LOGIN=me; INBOX_REPO=o/n
+  local rows="$GOBLIN_HOME/rows"
+  { inbox_classify "$(_entry 1 a false other me)" me "me" me            # waiting
+    inbox_classify "$(_entry 2 b true  other me)" me "me" me            # draft
+    inbox_classify "$(_entry 3 c false other me)" me "me" me Flexipie   # reviewed by other
+    inbox_classify "$(_entry 4 d false other me alice)" me "me
+alice" alice                                                            # someone else
+  } > "$rows"
+  inbox_write "$rows"
+
+  # The list shows ONLY genuinely-awaiting PRs.
+  eq "1" "$(jq -r '.prs | length' "$INBOX")" || return 1
+  eq "1" "$(jq -r '.prs[0].number' "$INBOX")" || return 1
+  # and the count cannot disagree with the list
+  eq "$(jq -r '.counts.waiting' "$INBOX")" "$(jq -r '.prs | length' "$INBOX")" || return 1
+  # the rest are counted, not listed
+  eq "1" "$(jq -r '.counts.drafts' "$INBOX")" || return 1
+  eq "1" "$(jq -r '.counts.reviewedByOther' "$INBOX")" || return 1
+  eq "1" "$(jq -r '.counts.assignedElsewhere' "$INBOX")" || return 1
+  teardown
+}
+
+test_human_reviewer_detection() {
+  setup
+  . "$ROOT/lib/github.sh"
+  GOBLIN_LOGIN=me
+  local f="$GOBLIN_HOME/reviews.json"
+
+  # A realistic payload from a busy repo.
+  cat > "$f" <<'JSON'
+[
+  {"user":{"login":"greptile-apps[bot]","type":"Bot"},"state":"COMMENTED","body":"bot review"},
+  {"user":{"login":"chatgpt-codex-connector[bot]","type":"Bot"},"state":"COMMENTED","body":"bot review"},
+  {"user":{"login":"me","type":"User"},"state":"COMMENTED","body":"<!-- goblin:review {\"headSha\":\"abc\"} -->\nthe goblin"},
+  {"user":{"login":"Flexipie","type":"User"},"state":"CHANGES_REQUESTED","body":"please fix"},
+  {"user":{"login":"wissam","type":"User"},"state":"PENDING","body":"half written"}
+]
+JSON
+  local got; got="$(gh_human_reviewers "$f" | paste -sd, -)"
+
+  # Flexipie counts.
+  case "$got" in *Flexipie*) ;; *) echo "missed a real reviewer: '$got'"; return 1 ;; esac
+  # Bots do NOT. greptile reviews nearly every PR in some repos, so counting bots
+  # would mean the Goblin never reviews anything — the opposite of the point.
+  case "$got" in *bot*) echo "counted a bot: '$got'"; return 1 ;; esac
+  # Our own marked review is us, not a person.
+  case "$got" in *me*) echo "counted the goblin as a human: '$got'"; return 1 ;; esac
+  # An unsubmitted review is not a review.
+  case "$got" in *wissam*) echo "counted a PENDING review: '$got'"; return 1 ;; esac
+  teardown
+}
+
+test_our_own_manual_review_counts_as_human() {
+  setup
+  . "$ROOT/lib/github.sh"
+  GOBLIN_LOGIN=me
+  local f="$GOBLIN_HOME/reviews.json"
+  # Our login, but NO goblin marker: that is the human reviewing by hand, and he
+  # does not need a second opinion from his own laptop.
+  cat > "$f" <<'JSON'
+[{"user":{"login":"me","type":"User"},"state":"COMMENTED","body":"looks fine to me"}]
+JSON
+  eq "me" "$(gh_human_reviewers "$f" | paste -sd, -)" || return 1
+  teardown
+}
+
+test_panel_contract_matches_the_app() {
+  setup
+  . "$ROOT/lib/cmd_panel.sh"
+  # THE test that was missing. The app and the CLI each had their own tests and each
+  # passed, but nothing checked the contract BETWEEN them — so the app was sending
+  # `flag incremental-review` while this file only matched `incrementalReview`, and
+  # every toggle in the Behaviour and Notifications sections silently did nothing.
+  # Keys are derived from the Swift source rather than duplicated here, so adding a
+  # case in one place and forgetting the other fails immediately.
+  local sw="$ROOT/app/Command.swift"
+  [ -f "$sw" ] || { echo "Command.swift missing"; return 1; }
+
+  local bad="" k
+  # every `Command.panelSet("<key>", …)` the app can emit
+  for k in $(grep -oE 'Command\.panelSet\("[a-z-]+"' "$sw" | sed 's/.*panelSet("//;s/"//' | sort -u); do
+    [ "$k" = "flag" ] && continue          # covered below, per flag name
+    case "$k" in
+      # keys the app supplies with values we cannot guess generically
+      identity)        cmd_panel set "$k" someuser  >/dev/null 2>&1 || bad="$bad $k" ;;
+      verdict-mode)    cmd_panel set "$k" comment   >/dev/null 2>&1 || bad="$bad $k" ;;
+      provider-model)  cmd_panel set "$k" claude sonnet >/dev/null 2>&1 || bad="$bad $k" ;;
+      allow-approve)   cmd_panel set "$k" false     >/dev/null 2>&1 || bad="$bad $k" ;;
+      interval-minutes) cmd_panel set "$k" 15       >/dev/null 2>&1 || bad="$bad $k" ;;
+      *)               cmd_panel set "$k" 5         >/dev/null 2>&1 || bad="$bad $k" ;;
+    esac
+  done
+
+  # every FlagKey cliName the app can emit
+  for k in $(grep -oE 'case \.[a-zA-Z]+: *return "[a-z-]+"' "$sw" \
+             | sed 's/.*return "//;s/"//' | sort -u); do
+    cmd_panel set flag "$k" true >/dev/null 2>&1 || bad="$bad flag:$k"
+  done
+
+  [ -z "$bad" ] || { echo "the CLI refuses keys the app sends:$bad"; return 1; }
+  teardown
+}
+
+test_panel_has_no_generic_config_setter() {
+  # `config set <jq-path> <value>` from the UI was arbitrary code execution: point
+  # .providers.claude.bin at anything, then trigger a run. Every setting now has a
+  # named, validated verb and there is deliberately no passthrough.
+  grep -qE "cfg_set +\"?\\$" "$ROOT/lib/cmd_panel.sh" \
+    && { echo "cmd_panel.sh passes a caller-supplied jq path to cfg_set"; return 1; }
+  grep -q "'bin'" "$ROOT/lib/cmd_panel.sh" \
+    && { echo "cmd_panel.sh mentions a bin setting"; return 1; }
+  return 0
+}
+
+test_panel_settings_are_validated() {
+  setup
+  . "$ROOT/lib/cmd_panel.sh"
+  local before; before="$(cat "$CONFIG")"
+
+  # accepted
+  cmd_panel set max-per-day 30 >/dev/null 2>&1 || return 1
+  eq "30" "$(cfg_get '.maxReviewsPerDay' x)" || return 1
+  cmd_panel set verdict request-changes >/dev/null 2>&1 || return 1
+  eq "request-changes" "$(cfg_get '.verdictMode' x)" || return 1
+  cmd_panel set flag incrementalReview false >/dev/null 2>&1 || return 1
+  eq "false" "$(cfg_get '.incrementalReview' x)" || return 1
+
+  # refused, and each must leave config untouched
+  before="$(cat "$CONFIG")"
+  local bad
+  for bad in "max-per-day 9999" "max-per-day -1" "max-per-day abc" \
+             "max-per-run 0" "interval 0" "verdict yolo" \
+             "flag notAFlag true" "flag incrementalReview maybe" \
+             "identity bad~login" "identity ../etc" \
+             "model claude bad;name" "model nosuchprovider x" \
+             "bin claude /bin/sh" "nonsense 1"; do
+    # shellcheck disable=SC2086
+    if cmd_panel set $bad >/dev/null 2>&1; then
+      echo "accepted invalid setting: $bad"; return 1
+    fi
+    eq "$before" "$(cat "$CONFIG")" || { echo "config changed by: $bad"; return 1; }
+  done
+
+  # A value containing a space, with quoting intact — the loop above word-splits
+  # deliberately, so it cannot express this case.
+  before="$(cat "$CONFIG")"
+  cmd_panel set identity "has a space" >/dev/null 2>&1 \
+    && { echo "accepted a login containing a space"; return 1; }
+  eq "$before" "$(cat "$CONFIG")" || return 1
+
+  # a prompt path must not escape the repo
+  cfg_repo_add o/n >/dev/null 2>&1
+  before="$(cat "$CONFIG")"
+  cmd_panel set repo-prompt o/n '../../etc/passwd' >/dev/null 2>&1     && { echo "accepted a traversal prompt path"; return 1; }
+  cmd_panel set repo-prompt o/n '/etc/passwd' >/dev/null 2>&1     && { echo "accepted an absolute prompt path"; return 1; }
+  teardown
+}
+
+test_panel_csp_forbids_inline() {
+  local f="$ROOT/share/ui/panel.html"
+  [ -f "$f" ] || { echo "panel.html missing"; return 1; }
+  grep -q "default-src 'none'" "$f" || { echo "no restrictive CSP"; return 1; }
+  # unsafe-inline would make the whole DOM-only discipline pointless, and is the
+  # reason the CSS and JS live in separate files rather than inline blocks.
+  grep -q 'unsafe-inline' "$f" && { echo "CSP allows unsafe-inline"; return 1; }
+  # NOTE: on feat/menu-bar-app this test also asserted that share/ui/server.py and
+  # lib/ui.sh stayed deleted, because that branch retired the python panel outright.
+  # They are still here deliberately: the menu bar app is new on this trunk and
+  # `goblin ui` is the fallback while it earns trust. Retiring the python panel is a
+  # follow-up, and this assertion comes back with it.
+  return 0
+}
+
+test_panel_has_no_html_injection_sinks() {
+  # The old panel built rows with innerHTML from PR titles and repo slugs, and put
+  # them inside onclick="..." — two nested contexts, so one apostrophe broke out.
+  # Anyone able to open a PR in a watched repo could run JS in the panel. The fix is
+  # structural (build DOM, never markup), so the gate is structural too.
+  # Scoped to the menu bar app's own panel. The python panel (app.html) predates
+  # this discipline and still builds markup with innerHTML; it is reachable only
+  # over loopback behind a per-session token, whereas panel.html renders inside the
+  # app itself with the CSP asserted above, so the structural gate is what holds
+  # there. When the python panel is retired this widens back to share/ui/*.
+  local hits
+  hits="$(grep -nE 'innerHTML|outerHTML|insertAdjacentHTML|document\.write|onclick=|eval\(|new Function' \
+            "$ROOT/share/ui/panel.html" "$ROOT/share/ui/panel.js" \
+            "$ROOT/share/ui/wizard.js" 2>/dev/null || true)"
+  [ -z "$hits" ] || { echo "$hits"; return 1; }
+}
+
+test_app_build_stages_before_swapping() {
+  # The build used to killall the app and then compile and copy straight into
+  # ~/Applications/…app. That takes ten-plus seconds, the bar's LaunchAgent has
+  # KeepAlive, and macOS refuses to let an unprivileged process modify a signed
+  # bundle whose app is running — so the copy EPERMed partway and left a bundle with
+  # an executable and no Info.plist. Compiling swift here would make the suite slow
+  # and machine-dependent, so assert the structure that prevents it instead.
+  local src="$ROOT/lib/app.sh"
+
+  # resources and the plist are written under the staging dir, never APP_BUNDLE
+  grep -qE 'stage="\$GOBLIN_HOME/build/' "$src" \
+    || { echo "app_build no longer stages the bundle"; return 1; }
+  grep -qE 'plist="\$stage/Contents/Info.plist"' "$src" \
+    || { echo "the Info.plist is not written into the staging bundle"; return 1; }
+  grep -qE 'macos="\$stage/Contents/MacOS"' "$src" \
+    || { echo "the executable is not built into the staging bundle"; return 1; }
+
+  # the swap must be gated on a complete bundle, or staging buys nothing
+  grep -q 'app_swap_bundle' "$src" || { echo "no swap step"; return 1; }
+  grep -qE 'plutil -extract GBLCLIPath raw "\$plist"' "$src" \
+    || { echo "the swap is not gated on the CLI path being present"; return 1; }
+
+  # and it must take the LaunchAgent down first, or KeepAlive relaunches the app
+  # from a path being deleted — the original corruption
+  grep -q 'launchctl bootout' "$src" || { echo "the swap does not stop the agent"; return 1; }
+  return 0
+}
+
 printf '\n  goblin test suite\n\n'
 t "config: defaults"                     test_config_defaults
 t "config: corrupt file recovers"        test_config_corrupt_file_recovers
@@ -797,6 +1186,19 @@ t "security: caller env restored"        test_callers_environment_is_restored
 t "security: scrub invents nothing"      test_scrub_does_not_invent_unset_vars
 t "security: retry is scrubbed too"      test_scrub_survives_the_repair_retry
 t "security: hostile pr title in notify" test_notify_survives_hostile_pr_title
+t "inbox: classifier states"             test_inbox_classifier
+t "inbox: counts and shape"              test_inbox_counts_and_shape
+t "inbox: hides everything not waiting"  test_inbox_hides_everything_not_waiting
+t "inbox: human reviewer detection"      test_human_reviewer_detection
+t "inbox: own review counts as human"    test_our_own_manual_review_counts_as_human
+t "bar: stale failures are not faults" test_stale_failures_do_not_mark_the_icon_broken
+t "bar: glyph decision table"            test_bar_glyph_decision_table
+t "panel: contract matches the app"      test_panel_contract_matches_the_app
+t "panel: no generic config setter"      test_panel_has_no_generic_config_setter
+t "panel: settings are validated"        test_panel_settings_are_validated
+t "panel: csp forbids inline"            test_panel_csp_forbids_inline
+t "panel: no html injection sinks"       test_panel_has_no_html_injection_sinks
+t "app: build stages before swapping"    test_app_build_stages_before_swapping
 t "hygiene: no personal paths"           test_no_hardcoded_personal_paths
 
 printf '\n  %s passed, %s failed\n' "$PASS" "$FAIL"

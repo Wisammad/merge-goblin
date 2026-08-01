@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake osascript. Records how it was invoked so tests can prove that values
+# reach it as ARGV and are never interpolated into script source.
+#
+# Writes two files under $OSA_FAKE_DIR (default: a temp dir):
+#   argv   — one argument per line, exactly as received
+#   stdin  — the script text, if any was piped in
+: "${OSA_FAKE_DIR:=${TMPDIR:-/tmp}/goblin-osa-fake}"
+mkdir -p "$OSA_FAKE_DIR"
+
+printf '%s\n' "$@" > "$OSA_FAKE_DIR/argv"
+
+# `osascript -` reads the program from stdin; capture it for inspection.
+if [ "${1:-}" = "-" ]; then
+  cat > "$OSA_FAKE_DIR/stdin"
+fi
+
+# Deliberately execute nothing. A real injection would show up as extra argv
+# entries or as attacker text inside the script body, both of which the test
+# asserts against.
+exit 0

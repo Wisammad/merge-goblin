@@ -99,6 +99,25 @@ lock_release() { rmdir "$LOCKDIR" 2>/dev/null || true; }
 # Stable short hash of a string (used for finding ids and fleet assignment).
 goblin_hash() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-12; }
 
+# atomic_write <dest> — write stdin to dest via a temp file in the same directory.
+#
+# The menu bar app watches these files and re-reads on every change, so a reader
+# can arrive mid-write. A plain redirect truncates first, which means the app
+# reliably sees a zero-byte or half-written JSON file and renders an empty panel.
+# The empty check matters as much as the rename: a jq program that failed leaves
+# nothing on stdout, and replacing good state with an empty file is worse than
+# keeping the stale copy.
+atomic_write() {
+  local dest="$1" tmp rc
+  tmp="$(mktemp "${dest}.XXXXXX")" || return 1
+  cat > "$tmp"; rc=$?
+  if [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$dest" && return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
 # Portable lowercase (bash 3.2 has no ${x,,}).
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 

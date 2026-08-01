@@ -38,7 +38,11 @@ goblin_default_config() {
   "notify": { "started": true, "posted": true, "failed": true, "budget": true, "sound": true },
   "refsForbidden": false,
   "refsForbiddenAt": 0,
-  "update": { "notify": true, "checkEverySecs": 86400 }
+  "update": { "notify": true, "checkEverySecs": 86400 },
+  "maxReviewsPerDay": 20,
+  "skipIfHumanReviewed": true,
+  "setupComplete": false,
+  "cache": { "reposTtlSecs": 3600 }
 }
 JSON
 }
@@ -107,6 +111,18 @@ cfg_repo_add() {  # <slug>
   cfg_ensure
   cfg_set --arg s "$1" \
     'if ([.repos[]?.slug] | index($s)) then . else .repos += [{slug:$s, enabled:true, promptPath:"", login:""}] end'
+}
+
+# cfg_repo_set_field <slug> <field> <value> — the setter half of cfg_repo_field.
+#
+# The value is run through jq -R so "5" stores as a number and "true" as a boolean
+# rather than as strings: the panel sends everything as text, and a string where a
+# boolean belongs reads as truthy forever afterwards.
+cfg_repo_set_field() {
+  local slug="$1" field="$2" raw="$3" val
+  val="$(printf '%s' "$raw" | jq -R 'tonumber? // (if . == "true" then true elif . == "false" then false else . end)')"
+  cfg_set --arg s "$slug" --arg f "$field" --argjson v "$val" \
+    '.repos |= map(if .slug == $s then .[$f] = $v else . end)'
 }
 
 cfg_repo_rm()     { cfg_set --arg s "$1" '.repos |= map(select(.slug != $s))'; }

@@ -3,6 +3,13 @@
 
 agent_running() { launchctl print "gui/$(id -u)/${AGENT_LABEL}" >/dev/null 2>&1; }
 
+# Installed is not the same as running, and the menu bar icon depends on the
+# difference: "a schedule exists but did not load" is a fault worth a red glyph,
+# whereas "no schedule was ever installed" is just a machine that hasn't been set
+# up, which doctor already reports. Without this the icon cried wolf on every
+# --no-agent install.
+agent_installed() { [ -f "$AGENT_PLIST" ]; }
+
 # A persistent `disable` override survives reboots/logins — unlike a plain
 # bootout, which the plist re-loads at next login. This is what makes "off"
 # actually mean off.
@@ -55,4 +62,16 @@ gh_assert_identity() {
   actual="$(gh api user --jq .login 2>/dev/null)"
   [ -z "$want" ] && return 0
   [ "$actual" = "$want" ]
+}
+
+# Pin the token and confirm the identity, without any of the engine's git
+# plumbing. Read-only commands — `inbox`, the panel's queries — need a correctly
+# scoped token but have no business exporting a GIT_CONFIG URL rewrite into their
+# environment, and they must not have to source the whole engine to get one.
+engine_auth_lite() {
+  command -v gh >/dev/null 2>&1 || return 1
+  GOBLIN_LOGIN="$(goblin_login)"
+  gh_pin_token "$GOBLIN_LOGIN" || return 1
+  gh_assert_identity "$GOBLIN_LOGIN" || return 1
+  return 0
 }

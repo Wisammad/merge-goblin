@@ -70,11 +70,12 @@ cmd_ctl() {
       local sub="${1:-list}"; shift 2>/dev/null || true
       case "$sub" in
         list|"") cfg_read | jq -r '.repos[]? | "\(if .enabled != false then "on " else "off" end)  \(.slug)"' ;;
+        search)  . "$LIB_DIR/discover.sh"; cmd_repos_search "$@" ;;
         add)     cfg_repo_add "$1"; status_set '{}'; echo "added $1" ;;
         rm)      cfg_repo_rm "$1";  status_set '{}'; echo "removed $1" ;;
         enable)  cfg_repo_enable "$1" true;  status_set '{}'; echo "enabled $1" ;;
         disable) cfg_repo_enable "$1" false; status_set '{}'; echo "disabled $1" ;;
-        *) echo "usage: $GOBLIN_SLUG repos [list|add SLUG|rm SLUG|enable SLUG|disable SLUG]" >&2; return 2 ;;
+        *) echo "usage: $GOBLIN_SLUG repos [list|search|add SLUG|rm SLUG|enable SLUG|disable SLUG]" >&2; return 2 ;;
       esac ;;
 
     provider)

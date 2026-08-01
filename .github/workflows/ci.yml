@@ -45,6 +45,24 @@ jobs:
       - name: tests
         run: ./tests/run.sh
 
+      - name: menu bar app compiles
+        # The app is Swift but needs no Xcode project: AppKit and WebKit are in the
+        # Command Line Tools alone. Building it here is the only thing that catches a
+        # panel resource added to share/ui but never wired into ResourceScheme, and a
+        # compile break in code the shell suite cannot reach.
+        run: |
+          GOBLIN_HOME="$RUNNER_TEMP/apphome" \
+          GOBLIN_APP_BUNDLE="$RUNNER_TEMP/MergeGoblin.app" \
+            ./bin/goblin app build
+          test -x "$RUNNER_TEMP/MergeGoblin.app/Contents/MacOS/GoblinBar"
+          # The bundle is useless without this key — the app pins the CLI path from
+          # it and fails closed if it is missing, which is exactly how a half-written
+          # bundle used to surface as "the CLI path is missing from the app bundle".
+          plutil -extract GBLCLIPath raw "$RUNNER_TEMP/MergeGoblin.app/Contents/Info.plist"
+
+      - name: app command allowlist tests
+        run: GOBLIN_HOME="$RUNNER_TEMP/apphome" ./bin/goblin app test
+
       - name: install smoke test
         # Runs install.sh unmodified. The runner has no AI CLI and no interactive
         # gh login, so a stub provider goes on PATH and the built-in token

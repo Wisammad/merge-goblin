@@ -83,6 +83,43 @@ gh_prior_review() {
     | sort_by(.submitted_at) | last // empty' 2>/dev/null
 }
 
+# gh_reviews_fetch <slug> <pr> <dest> — the raw reviews array, to a file.
+#
+# A file rather than a pipe because two callers want two different questions
+# answered from the same page of results (has a human reviewed this, and what did
+# the Goblin last say), and paying for the round trip twice per PR per poll adds up
+# fast on a repo with twenty open PRs. Fails if the response is not an array, so a
+# rate-limit error object can never be read as "no reviews".
+gh_reviews_fetch() {
+  gh api --paginate "repos/$1/pulls/$2/reviews?per_page=100" > "$3" 2>/dev/null || return 1
+  jq -e 'type == "array"' "$3" >/dev/null 2>&1 || return 1
+}
+
+# gh_human_reviewers <reviews-file> — logins of real people who have reviewed.
+#
+# Three exclusions, each one a wrong answer we have seen:
+#   * PENDING reviews are drafts only their author can see
+#   * bots, by user.type and by the "[bot]" suffix, because a review from another
+#     automation is not a human having looked at this
+#   * the Goblin's OWN reviews, which are posted under a human token and so are
+#     indistinguishable from that human's reviews except by the hidden marker.
+#     Without this the Goblin sees its own review, concludes a human is on it, and
+#     never reviews that repo again.
+gh_human_reviewers() {
+  jq -r --arg me "${GOBLIN_LOGIN:-}" \
+        --arg ns "$GOBLIN_MARKER_NS" '
+    [ .[]
+      | select((.state // "") != "PENDING")
+      | select(((.user.type // "") | ascii_downcase) != "bot")
+      | select(((.user.login // "") | test("\\[bot\\]$")) | not)
+      | select(
+          ((.user.login // "") | ascii_downcase) != ($me | ascii_downcase)
+          or ((.body // "") | test("<!-- " + $ns + ":review ") | not)
+        )
+      | .user.login ]
+    | unique | .[]' "$1" 2>/dev/null
+}
+
 # gh_prior_findings <slug> <pr> — ids/titles already posted inline, for dedupe.
 # `.line` can be null on outdated comments (only the deprecated `position`
 # survives), so fall back to original_line.

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    bar-agent.plist.tmpl — "Start at login" for the menu bar app.
+
+    A LaunchAgent, deliberately, and NOT SMAppService.
+
+    SMAppService.register() validates the calling bundle's code signature and
+    wants a stable code-signing identity to key the login item to. This app is
+    ad-hoc signed by lib/app.sh on the machine it runs on, so its cdhash changes
+    on every rebuild — and rebuilding IS the documented upgrade path (re-run
+    install.sh, or `goblin app rebuild` after editing panel.css). With
+    SMAppService the registration would keep pointing at an identity that no
+    longer exists, and the login item would quietly stop working with no error
+    anywhere the user would ever look. A plist in ~/Library/LaunchAgents keyed on
+    an absolute path has no such coupling.
+
+    ProgramArguments launches the executable directly rather than `open -a`.
+    `open` returns as soon as it has asked LaunchServices to start the app, so
+    launchd sees the job exit immediately and, with KeepAlive, respawns it in a
+    loop.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXEC__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Respawn a crash, but never fight a deliberate Quit. The menu's quit item
+         is "Quit — reviews keep running", and a user who chooses it must not have
+         the goblin reappear two seconds later. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Interactive, not Background: this draws in the menu bar and must not be
+         throttled to background I/O and CPU priority. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <!-- Aqua only. Without this the job would also be loaded in non-GUI session
+         types, where there is no menu bar to draw into. -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>

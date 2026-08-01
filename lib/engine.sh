@@ -14,6 +14,8 @@
 . "$LIB_DIR/prompt.sh"
 . "$LIB_DIR/diff.sh"
 . "$LIB_DIR/update.sh"
+. "$LIB_DIR/attempts.sh"
+. "$LIB_DIR/inbox.sh"
 
 ONLY_PR=""; ONLY_REPO=""; DRY_RUN=false; FORCE=false; SCHEDULED=false
 REVIEWS_THIS_RUN=0
@@ -108,13 +110,29 @@ engine_gates() {
 # Checked before EVERY review, not just at run start — a backlog run used to
 # blow past the cap by 2x before the next cycle noticed.
 engine_budget_ok() {
-  local cap spent max_run
+  local cap spent max_run max_day done_today
   cap="$(cfg_get '.budgetCapUsd' 0)"
   max_run="$(cfg_get '.maxReviewsPerRun' 5)"
+  max_day="$(cfg_get '.maxReviewsPerDay' 0)"
 
   if [ "${max_run:-0}" -gt 0 ] && [ "$REVIEWS_THIS_RUN" -ge "$max_run" ]; then
     log "hit maxReviewsPerRun ($max_run) — stopping this cycle"
     return 1
+  fi
+
+  # A count cap as well as a dollar cap, because the dollar cap cannot protect a
+  # subscription provider: `cost not reported` means today_spend() stays at 0
+  # forever and budgetCapUsd never fires. On a repo with a large backlog that is
+  # an unbounded number of reviews against a subscription with its own hidden
+  # quota — and hitting a provider's quota is the failure that takes the Goblin
+  # down for everyone on the team, not just for the PR that tripped it.
+  if [ "${max_day:-0}" -gt 0 ] 2>/dev/null; then
+    done_today="$(today_review_count)"
+    if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
+      log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
+      status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+      return 1
+    fi
   fi
   spent="$(today_spend)"
   if [ "$(jq -n --argjson c "${cap:-0}" --argjson s "${spent:-0}" '($c>0) and ($s>=$c)' 2>/dev/null)" = "true" ]; then
@@ -183,51 +201,8 @@ engine_repo() {
 }
 
 # --- failure backoff -------------------------------------------------------
-# Oldest-first ordering plus a 5-minute poll means a permanently-failing PR sits
-# at the head of every queue and burns a model call each time. Honour the
-# `failure` block that config.json has always carried: after maxAttempts, hold
-# that COMMIT off until the backoff expires. A new push clears it, because the
-# key includes the sha.
-attempt_file() { printf '%s/attempts.json' "$GOBLIN_HOME"; }
-
-attempt_blocked() {
-  local key="$1" f; f="$(attempt_file)"
-  [ -f "$f" ] || return 1
-  local next; next="$(jq -r --arg k "$key" '.[$k].nextAt // 0' "$f" 2>/dev/null)"
-  [ "${next:-0}" = "null" ] && next=0
-  [ "$(now_epoch)" -lt "${next:-0}" ] 2>/dev/null
-}
-
-attempt_record() {
-  local key="$1" kind="${2:-other}" f; f="$(attempt_file)"
-  [ -f "$f" ] || echo '{}' > "$f"
-  local maxa base cap n delay
-  maxa="$(cfg_get '.failure.maxAttempts' 3)"
-  base="$(cfg_get '.failure.backoffBaseSecs' 3600)"
-  cap="$(cfg_get '.failure.maxBackoffSecs' 86400)"
-  n="$(jq -r --arg k "$key" '.[$k].n // 0' "$f" 2>/dev/null)"; n=$((${n:-0} + 1))
-  # Only start backing off once the PR has burned its free attempts; a single
-  # transient blip should retry on the very next poll.
-  if [ "$n" -lt "${maxa:-3}" ]; then delay=0; else
-    delay="$base"; local k="$n"
-    while [ "$k" -gt "${maxa:-3}" ] && [ "$delay" -lt "${cap:-86400}" ]; do
-      delay=$((delay * 2)); k=$((k - 1))
-    done
-    [ "$delay" -gt "${cap:-86400}" ] && delay="$cap"
-  fi
-  jq --arg k "$key" --argjson n "$n" --argjson at "$(now_epoch)" \
-     --argjson next "$(( $(now_epoch) + delay ))" --arg kind "$kind" \
-     '.[$k] = {n:$n, lastAt:$at, nextAt:$next, kind:$kind}' "$f" > "$f.tmp" 2>/dev/null \
-     && mv "$f.tmp" "$f"
-  [ "$delay" -gt 0 ] && log "  #${key%%:*}: $n consecutive failures — holding this commit for $((delay / 60))m"
-  return 0
-}
-
-attempt_clear() {
-  local key="$1" f; f="$(attempt_file)"
-  [ -f "$f" ] || return 0
-  jq --arg k "$key" 'del(.[$k])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
-}
+# Moved to lib/attempts.sh (sourced above) so inbox.sh and state.sh can read the
+# same file without sourcing this one. Behaviour is unchanged.
 
 # --- per PR ---------------------------------------------------------------
 engine_pr() {
@@ -282,6 +257,28 @@ engine_pr() {
       ledger_add "$key"
       return 0
     fi
+  fi
+
+  # --- gate: has a person already reviewed it? ---
+  # Free: reuses the reviews page fetched for the gate above. The Goblin exists to
+  # look at PRs nobody has looked at; once a colleague has left a real review,
+  # adding an automated one on top is noise on a thread that already has a human
+  # owner. Its own reviews are excluded by marker inside gh_human_reviewers — they
+  # are posted under a human token and are otherwise indistinguishable, and without
+  # that exclusion the Goblin sees itself and never reviews the repo again.
+  if [ "$(cfg_get '.skipIfHumanReviewed' true)" = "true" ] && [ "$FORCE" != true ] \
+     && [ -z "$ONLY_PR" ]; then
+    local rj humans; rj="$RUNTMP/reviews-$pr-$$.json"
+    if gh_reviews_fetch "$slug" "$pr" "$rj"; then
+      humans="$(gh_human_reviewers "$rj" | paste -sd, - 2>/dev/null)"
+      if [ -n "$humans" ]; then
+        log "  #$pr: already reviewed by $humans, skipping"
+        ledger_add "$key"
+        rm -f "$rj" 2>/dev/null
+        return 0
+      fi
+    fi
+    rm -f "$rj" 2>/dev/null
   fi
 
   engine_budget_ok || return 1

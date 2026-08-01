@@ -54,17 +54,28 @@ scheduler behind your back. Turn the check off with `goblin config set .update.n
 brew install gh jq                      # if you need them
 ```
 
-The installer also drops **Merge Goblin.app** in `~/Applications` — double-click it (or run
-`goblin ui`) to open the control panel, where everything below can be changed without
-touching a terminal. It's a local page served on `127.0.0.1`, so there is no Swift,
-no Xcode, no build step and nothing to notarise.
+The installer also drops **Merge Goblin.app** in `~/Applications` — a menu bar app that
+shows what he's doing, which PRs are waiting for you, and lets you change everything below
+without touching a terminal. Turn on **Start at login** from its menu and it's there every
+morning.
+
+It's compiled on your machine from `app/` (about ten seconds, AppKit and WebKit only) and
+ad-hoc signed, so there is no Xcode project, nothing to notarise and no Gatekeeper prompt.
+`xcode-select --install` is all it needs; if `swiftc` is missing the installer skips the app
+and says so, because the CLI works without it.
+
+```bash
+goblin app rebuild          # after editing share/ui/panel.css or app/*.swift
+goblin app status           # bundle, login item, whether it's running
+```
 
 ## Use
 
-Most people only need the control panel:
+Most people only need the menu bar app. There's also a browser panel, which is
+the fallback if the app won't build:
 
 ```bash
-goblin ui                   # open it (or double-click Merge Goblin.app)
+goblin ui                   # the browser panel on 127.0.0.1
 ```
 
 Everything is adjustable there: the on/off switch, snooze, which subscription

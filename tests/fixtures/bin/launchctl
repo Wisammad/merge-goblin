@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Fake `launchctl` so tests can drive agent state without touching the real one.
+#
+#   LC_FAKE_RUNNING=1   `print <label>` succeeds (the agent is loaded)
+#   LC_FAKE_DISABLED=1  `print-disabled` reports our label as disabled
+#   LC_FAKE_LOG         append each invocation here
+#
+# Unset means "not running, not disabled". Mutating verbs are no-ops: a test must
+# never be able to bootstrap or bootout anything on the developer's machine.
+[ -n "${LC_FAKE_LOG:-}" ] && printf '%s\n' "$*" >> "$LC_FAKE_LOG"
+
+case "${1:-}" in
+  print)
+    [ -n "${LC_FAKE_RUNNING:-}" ] && exit 0
+    exit 113 ;;
+  print-disabled)
+    if [ -n "${LC_FAKE_DISABLED:-}" ]; then
+      printf '\t"%s" => disabled\n' "${LC_FAKE_LABEL:-com.test.goblin}"
+    fi
+    exit 0 ;;
+  bootstrap|bootout|enable|disable|kickstart) exit 0 ;;
+  *) exit 0 ;;
+esac

@@ -28,7 +28,17 @@ if [ -f "$AGENT_PLIST" ] || launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/nu
   echo "  ✓ scheduler removed"
 fi
 
-rm -rf "$HOME/Applications/$GOBLIN_SHORT.app" 2>/dev/null && echo "  ✓ control panel app removed"
+# The menu bar app owns a SECOND launch agent — its "start at login" item, whose
+# label is the bundle id and not AGENT_LABEL. Removing only the review scheduler
+# above left that one loaded, so the bar kept relaunching an app whose bundle had
+# just been deleted. app_remove takes both down together.
+if [ -f "$SRC/lib/app.sh" ]; then
+  # shellcheck source=lib/app.sh
+  . "$SRC/lib/app.sh"
+  app_remove && echo "  ✓ menu bar app removed"
+else
+  rm -rf "$HOME/Applications/$GOBLIN_SHORT.app" 2>/dev/null && echo "  ✓ app removed"
+fi
 
 rm -f "$HOME/.local/bin/$GOBLIN_SLUG" 2>/dev/null && echo "  ✓ cli unlinked"
 rm -rf "$GOBLIN_HOME/app" 2>/dev/null && echo "  ✓ app removed"

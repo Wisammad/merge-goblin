@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+<title>The Merge Goblin</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+
+<!-- Shown only when the WKWebView bridge is missing (i.e. the file was opened
+     in a plain browser). Everything on screen is then invented, so say so
+     loudly — mock data must never be mistaken for the real thing. -->
+<div id="mockRibbon" class="ribbon" role="status" hidden>
+  <strong>MOCK DATA</strong> — no Goblin bridge, nothing here is real
+</div>
+
+<header class="top">
+  <span class="logo"><img src="goblin.svg" alt="" width="30" height="30"></span>
+  <span class="top-txt">
+    <span class="top-name" id="appName">The Merge Goblin</span>
+    <span class="top-sub" id="activity">…</span>
+  </span>
+  <span class="pill" id="statePill">
+    <span class="dot" id="dot" aria-hidden="true"></span>
+    <span id="stateTx">…</span>
+  </span>
+</header>
+
+<!-- role=alert: things that are broken right now -->
+<div id="errors" role="alert" aria-live="assertive"></div>
+<!-- advisory, non-alerting -->
+<div id="banners"></div>
+
+<!-- first run takes over the whole panel; built by wizard.js -->
+<section id="wizard" class="wizard" aria-label="Setup" hidden></section>
+
+<main id="main">
+
+  <section class="card" aria-labelledby="h-power">
+    <h2 id="h-power">Power</h2>
+    <div class="row">
+      <label class="grow lbl" for="power">
+        <span class="label">On duty</span>
+        <span class="hint" id="powerHint">reviews the PRs that request your review</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="power"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="btns" id="powerActions"></div>
+    <div class="row">
+      <span class="grow">
+        <span class="label">Quiet for a while</span>
+        <span class="hint" id="snoozeHint">temporarily stop, then resume by itself</span>
+      </span>
+    </div>
+    <div class="btns">
+      <button class="small" type="button" data-snooze="hour">1 hour</button>
+      <button class="small" type="button" data-snooze="tomorrow">Until tomorrow</button>
+      <button class="small" type="button" id="clearSnooze" data-snooze="clear" hidden>Wake up now</button>
+    </div>
+    <p class="hint tight" id="nextRun"></p>
+  </section>
+
+  <section class="card" aria-labelledby="h-inbox">
+    <h2 id="h-inbox">Awaiting review</h2>
+    <div class="row">
+      <span class="grow stat-inline">
+        <span><b id="inboxWaiting">0</b><span>waiting</span></span>
+        <span><b id="inboxMine">0</b><span>yours</span></span>
+      </span>
+      <button class="small" type="button" id="inboxRefresh">Refresh</button>
+    </div>
+    <div id="inboxList"></div>
+    <!-- states that are NOT awaiting review (drafts, already reviewed, a
+         teammate's) are counted here and never rendered as list rows -->
+    <p class="hint tight" id="inboxOther"></p>
+    <p class="hint tight" id="inboxMeta"></p>
+  </section>
+
+  <section class="card" aria-labelledby="h-activity">
+    <h2 id="h-activity">Activity</h2>
+    <div class="stat">
+      <div><b id="rToday">0</b><span>today</span></div>
+      <div><b id="rTotal">0</b><span>all time</span></div>
+      <div><b id="sToday">—</b><span>spent today</span></div>
+      <div><b id="sTotal">—</b><span>spent total</span></div>
+    </div>
+    <p class="hint tight" id="costNote"></p>
+    <div class="row">
+      <span class="grow"><span class="hint" id="lastRun">—</span></span>
+      <button class="small" type="button" id="dryRun">Dry run</button>
+      <button class="small primary" type="button" id="reviewNow">Review now</button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-prov">
+    <h2 id="h-prov">Who does the reviewing</h2>
+    <!-- role=group, not radiogroup: this holds the sign-in help for anything
+         that cannot review yet as well as the radios, and a radiogroup is only
+         supposed to own radios. The shared input name still groups them. -->
+    <div id="provs" role="group" aria-labelledby="h-prov"></div>
+    <div class="row">
+      <label class="grow lbl" for="modelSelect">
+        <span class="label">Model</span>
+        <span class="hint" id="modelHint">pick one, or Custom… for anything else</span>
+      </label>
+    </div>
+    <!-- The options are built per provider in panel.js. Typing an exact model
+         name was the only way to change this, so a typo silently became a
+         model the CLI does not have. -->
+    <div class="field">
+      <select id="modelSelect"></select>
+      <button class="small" type="button" id="saveModel">Save</button>
+    </div>
+    <div class="field tight" id="modelCustomRow" hidden>
+      <label class="sr-only" for="model">Custom model name</label>
+      <input type="text" id="model" autocomplete="off" spellcheck="false" placeholder="e.g. opus-4.1">
+    </div>
+    <div class="row">
+      <span class="grow"><span class="hint">Each provider bills your own subscription.</span></span>
+      <button class="small ghost" type="button" id="refreshProviders">Re-check</button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-limits">
+    <h2 id="h-limits">Limits</h2>
+    <div class="row">
+      <label class="grow lbl" for="capDay">
+        <span class="label">Reviews per day</span>
+        <span class="hint">pause once this many have posted today — 0 for no cap</span>
+      </label>
+      <span class="field w-sm"><input type="number" id="capDay" min="0" max="500" step="1" inputmode="numeric"></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="maxRun">
+        <span class="label">Reviews per run</span>
+        <span class="hint">stops a backlog running away</span>
+      </label>
+      <span class="field w-sm"><input type="number" id="maxRun" min="1" max="50" step="1" inputmode="numeric"></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="maxFind">
+        <span class="label">Findings per review</span>
+        <span class="hint">keeps reviews readable</span>
+      </label>
+      <span class="field w-sm"><input type="number" id="maxFind" min="1" max="200" step="1" inputmode="numeric"></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-repos">
+    <h2 id="h-repos">Repositories</h2>
+    <div id="repos"></div>
+    <div class="field tight">
+      <label class="sr-only" for="newRepo">Add a repository</label>
+      <input type="text" id="newRepo" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="owner/name">
+      <button class="small" type="button" id="addRepo">Add</button>
+    </div>
+    <div id="repoSuggest" class="suggest" aria-label="Search results"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-behaviour">
+    <h2 id="h-behaviour">Behaviour</h2>
+    <label class="lbl block" for="verdict">
+      <span class="label">Verdict</span>
+      <span class="hint" id="verdictHint">what the Goblin submits the review as</span>
+    </label>
+    <select id="verdict">
+      <option value="comment">Comment only — never approves or blocks</option>
+      <option value="request-changes">Request changes when it finds a blocker</option>
+      <option value="full">Full — may also approve clean PRs</option>
+    </select>
+    <div class="row tight">
+      <label class="grow lbl" for="fIncr">
+        <span class="label">Only review what changed</span>
+        <span class="hint">avoids repeating findings after a push</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="fIncr"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <!-- ON is the safe reading and the default: a PR a human has already looked
+         at is left alone. Switching it OFF makes the Goblin review MORE, so
+         panel.js confirms that direction (and only that direction). -->
+    <div class="row">
+      <label class="grow lbl" for="fSkipReviewed">
+        <span class="label">Skip PRs a teammate already reviewed</span>
+        <span class="hint">off means he will also review PRs someone has already looked at</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="fSkipReviewed"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="fCommit">
+        <span class="label">Post a commit status</span>
+        <span class="hint">a green tick on the PR when the review lands</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="fCommit"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="fFleet">
+        <span class="label">Share PRs with teammates</span>
+        <span class="hint">each PR goes to exactly one Goblin, so nobody double-reviews</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="fFleet"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div id="fleet" class="tags"></div>
+    <div class="row">
+      <label class="grow lbl" for="interval">
+        <span class="label">Check every</span>
+        <span class="hint">minutes between runs</span>
+      </label>
+      <span class="field w-sm"><input type="number" id="interval" min="1" max="1440" step="1" inputmode="numeric"></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-notify">
+    <h2 id="h-notify">Notifications</h2>
+    <div class="row">
+      <label class="grow lbl" for="nStart">When a review starts</label>
+      <span class="switch"><input type="checkbox" id="nStart"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="nPost">When a review is posted</label>
+      <span class="switch"><input type="checkbox" id="nPost"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="nFail">When something fails</label>
+      <span class="switch"><input type="checkbox" id="nFail"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="nBudget">When the daily cap is reached</label>
+      <span class="switch"><input type="checkbox" id="nBudget"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+    <div class="row">
+      <label class="grow lbl" for="nSound">Play a sound</label>
+      <span class="switch"><input type="checkbox" id="nSound"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-health">
+    <h2 id="h-health">Health</h2>
+    <div class="btns tight">
+      <button class="small" type="button" id="runDoctor">Run checks</button>
+      <button class="small" type="button" id="fixDoctor">Fix what can be fixed</button>
+    </div>
+    <p class="hint tight" id="doctorSummary"></p>
+    <div id="doctorList"></div>
+  </section>
+
+  <section class="card" aria-labelledby="h-hist">
+    <h2 id="h-hist">Recent reviews</h2>
+    <div class="row">
+      <span class="grow"><span class="hint" id="histHint">what the Goblin has posted lately</span></span>
+      <!-- Clear is a VIEW filter. There is no verb that deletes events.jsonl and
+           there must not be: the ledger is the audit trail. -->
+      <button class="small ghost" type="button" id="clearHist"
+              title="only hides them in this panel — nothing is deleted">Clear</button>
+    </div>
+    <div id="hist"></div>
+    <!-- Paging lives in static markup, wired once, so pressing "View more" does
+         not rebuild the button under the pointer/focus. panel.js owns how many
+         rows are revealed and keeps that across the 5-second state pushes. -->
+    <div class="row" id="histPager" hidden>
+      <span class="grow"><span class="hint" id="histCount" aria-live="polite"></span></span>
+      <button class="small" type="button" id="histMore" hidden>View more</button>
+      <button class="small ghost" type="button" id="histLess" hidden>Show less</button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="h-account">
+    <h2 id="h-account">Account</h2>
+    <div class="row">
+      <span class="grow">
+        <span class="label" id="identityLine">—</span>
+        <span class="hint" id="identityHint"></span>
+      </span>
+      <button class="small" type="button" id="pickAccount">Change</button>
+    </div>
+    <div id="accountList"></div>
+    <div class="row">
+      <label class="grow lbl" for="loginItem">
+        <span class="label">Open at login</span>
+        <span class="hint">keeps the Goblin in your menu bar after a restart</span>
+      </label>
+      <span class="switch"><input type="checkbox" id="loginItem"><span class="slider" aria-hidden="true"></span></span>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p class="hint" id="foot"></p>
+    <div class="btns center">
+      <button class="small ghost" type="button" id="openLog">Log</button>
+      <button class="small ghost" type="button" id="openConfig">Config</button>
+      <button class="small ghost" type="button" id="copyDiag">Copy diagnostics</button>
+    </div>
+  </footer>
+
+</main>
+
+<!-- our own confirm: window.confirm depends on a native panel the host app may
+     not implement, and a silent false would make destructive UI look broken -->
+<div id="confirm" class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmBody" hidden>
+  <div class="modal-box">
+    <h3 id="confirmTitle"></h3>
+    <p id="confirmBody"></p>
+    <div class="btns end">
+      <button class="small" type="button" id="confirmNo">Cancel</button>
+      <button class="small primary" type="button" id="confirmYes">Do it</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="panel.js"></script>
+<script src="wizard.js"></script>
+</body>
+</html>

@@ -36,6 +36,12 @@ GOBLIN_APP="${GOBLIN_APP:-$(cd "$(dirname "$_self")/.." && pwd)}"
 . "$GOBLIN_APP/lib/config.sh"
 # shellcheck source=lib/agent.sh
 . "$GOBLIN_APP/lib/agent.sh"
+# shellcheck source=lib/attempts.sh
+. "$GOBLIN_APP/lib/attempts.sh"
+# shellcheck source=lib/inbox.sh
+. "$GOBLIN_APP/lib/inbox.sh"
+# state.sh last: ui_state_write reads the inbox counts and the stuck list, so both
+# of the above have to exist by the time it is defined.
 # shellcheck source=lib/state.sh
 . "$GOBLIN_APP/lib/state.sh"
 
@@ -74,7 +80,15 @@ case "$cmd" in
   doctor)   . "$LIB_DIR/doctor.sh";      cmd_doctor "$@" ;;
   run)      . "$LIB_DIR/engine.sh";      cmd_run "$@" ;;
   migrate)  . "$LIB_DIR/migrate.sh";     cmd_migrate "$@" ;;
-  ui|panel|open) . "$LIB_DIR/ui.sh";    cmd_ui "$@" ;;
+  inbox)    cmd_inbox "$@" ;;
+  # `panel` is the menu bar app's settings channel — every write it makes goes
+  # through the named, validated verbs in cmd_panel.sh. It must be matched BEFORE
+  # the `ui` aliases, which used to include `panel` and would swallow it.
+  panel)    . "$LIB_DIR/cmd_panel.sh";   cmd_panel "$@" ;;
+  app)      . "$LIB_DIR/app.sh";         cmd_app "$@" ;;
+  accounts) . "$LIB_DIR/discover.sh";    cmd_accounts "$@" ;;
+  wizard)   . "$LIB_DIR/discover.sh";    cmd_wizard_state "$@" ;;
+  ui|open)  . "$LIB_DIR/ui.sh";          cmd_ui "$@" ;;
   update)   . "$LIB_DIR/update.sh";      cmd_update "$@" ;;
   version)  echo "$GOBLIN_NAME $GOBLIN_VERSION" ;;
   help|-h|--help) usage ;;
