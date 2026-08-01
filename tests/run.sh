@@ -540,6 +540,62 @@ test_scrub_survives_the_repair_retry() {
   teardown
 }
 
+test_adapter_is_only_invoked_through_the_scrub() {
+  setup
+  # The token regression was not a bad scrub — it was a refactor that called the
+  # adapter directly and bypassed one. CI ran the suite the whole time and stayed
+  # green, because the tests were deleted in the same change as the scrub.
+  #
+  # Behavioural tests cannot catch that on their own: a deleted test proves
+  # nothing. So assert the structure the scrub depends on — that there is exactly
+  # ONE place an adapter is invoked, and that it is inside findings_invoke.
+  local calls n
+  calls="$(grep -rn 'provider_\${[A-Za-z_]*}_review' "$ROOT/lib" \
+           | grep -vE ':[0-9]+: *#' || true)"
+  n="$(printf '%s' "$calls" | grep -c . || true)"
+  eq "1" "$n" || {
+    echo "expected exactly one dynamic adapter call site, found $n:"
+    printf '%s\n' "$calls"
+    echo "every adapter invocation must go through findings_invoke, which scrubs."
+    return 1
+  }
+  printf '%s' "$calls" | grep -q 'findings.sh:' \
+    || { echo "the adapter call site left findings.sh: $calls"; return 1; }
+  # ...and it is inside findings_invoke specifically, not merely in the same file.
+  awk '/^findings_invoke\(\)/{f=1}
+       f && /provider_\$\{[A-Za-z_]*\}_review/{found=1}
+       f && /^}/{f=0}
+       END{exit !found}' "$ROOT/lib/findings.sh" \
+    || { echo "the adapter call is no longer inside findings_invoke"; return 1; }
+  teardown
+}
+
+test_security_tests_are_still_registered() {
+  setup
+  # A security test that is defined but never added to the runner list below is
+  # dead weight that looks like coverage. Both halves must exist.
+  local t
+  # The panel entries belong here for the same reason as the scrub ones: the panel
+  # is a settings channel that could once point a provider binary at any executable
+  # and then trigger a run, and its guards are structural greps that a refactor can
+  # delete without anything else noticing.
+  for t in test_no_token_reaches_the_model \
+           test_callers_environment_is_restored \
+           test_scrub_survives_the_repair_retry \
+           test_adapter_is_only_invoked_through_the_scrub \
+           test_notify_survives_hostile_pr_title \
+           test_panel_has_no_generic_config_setter \
+           test_panel_settings_are_validated \
+           test_panel_csp_forbids_inline \
+           test_panel_has_no_html_injection_sinks; do
+    grep -q "^${t}() {" "$ROOT/tests/run.sh" \
+      || { echo "security test removed: $t"; return 1; }
+    grep -qE "^t .*[\"' ]${t}\$" "$ROOT/tests/run.sh" \
+      || { echo "security test defined but not registered with the runner: $t"; return 1; }
+  done
+  teardown
+}
+
 test_notify_survives_hostile_pr_title() {
   setup
   # A PR title is attacker-controlled. The old sed escaped `"` but not `\`, so
@@ -1217,6 +1273,8 @@ t "security: no token reaches the model" test_no_token_reaches_the_model
 t "security: caller env restored"        test_callers_environment_is_restored
 t "security: scrub invents nothing"      test_scrub_does_not_invent_unset_vars
 t "security: retry is scrubbed too"      test_scrub_survives_the_repair_retry
+t "security: one scrubbed call site"     test_adapter_is_only_invoked_through_the_scrub
+t "security: tests still registered"     test_security_tests_are_still_registered
 t "security: hostile pr title in notify" test_notify_survives_hostile_pr_title
 t "inbox: classifier states"             test_inbox_classifier
 t "inbox: counts and shape"              test_inbox_counts_and_shape
