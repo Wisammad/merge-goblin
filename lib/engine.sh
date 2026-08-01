@@ -13,6 +13,7 @@
 . "$LIB_DIR/claim.sh"
 . "$LIB_DIR/prompt.sh"
 . "$LIB_DIR/diff.sh"
+. "$LIB_DIR/update.sh"
 
 ONLY_PR=""; ONLY_REPO=""; DRY_RUN=false; FORCE=false; SCHEDULED=false
 REVIEWS_THIS_RUN=0
@@ -64,6 +65,14 @@ cmd_run() {
   for slug in $repos; do
     engine_repo "$slug" "$provider"
   done
+
+  # After the reviews, never before: a version check is the least important thing
+  # this run does and must not delay or risk the work. Throttled to once a day
+  # inside update_check, and it runs before the status write below so the panel
+  # picks the flag up on this run rather than the next one.
+  update_check
+  local newer; newer="$(update_available)" && \
+    log "update available: v$GOBLIN_VERSION → v$newer ($(update_instructions))"
 
   local fin; fin="$(now_epoch)"
   status_set "$(jq -nc --argjson f "$fin" \

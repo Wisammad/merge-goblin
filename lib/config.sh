@@ -37,7 +37,8 @@ goblin_default_config() {
   "incrementalReview": true,
   "notify": { "started": true, "posted": true, "failed": true, "budget": true, "sound": true },
   "refsForbidden": false,
-  "refsForbiddenAt": 0
+  "refsForbiddenAt": 0,
+  "update": { "notify": true, "checkEverySecs": 86400 }
 }
 JSON
 }

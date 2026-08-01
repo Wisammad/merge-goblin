@@ -62,6 +62,7 @@ $GOBLIN_EMOJI $GOBLIN_NAME v$GOBLIN_VERSION — $GOBLIN_TAGLINE
   goblin log [-f] [-n N]              tail the log
   goblin agent [status|start|stop|reload|label]
   goblin migrate [--from DIR]         import state from the old prauto/conductor setup
+  goblin update                       check for a newer $GOBLIN_SHORT (never installs)
   goblin version | help
 EOF
 }
@@ -74,6 +75,7 @@ case "$cmd" in
   run)      . "$LIB_DIR/engine.sh";      cmd_run "$@" ;;
   migrate)  . "$LIB_DIR/migrate.sh";     cmd_migrate "$@" ;;
   ui|panel|open) . "$LIB_DIR/ui.sh";    cmd_ui "$@" ;;
+  update)   . "$LIB_DIR/update.sh";      cmd_update "$@" ;;
   version)  echo "$GOBLIN_NAME $GOBLIN_VERSION" ;;
   help|-h|--help) usage ;;
   # everything else is a small control verb

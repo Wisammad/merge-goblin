@@ -8,10 +8,13 @@
 GOBLIN_NAME="The Merge Goblin"     # how it introduces itself
 GOBLIN_SHORT="Merge Goblin"        # when "The" reads badly mid-sentence
 GOBLIN_SLUG="goblin"               # cli name, state dir, ref namespace, label
-GOBLIN_VERSION="0.4.0"
+GOBLIN_VERSION="0.4.1"
 GOBLIN_TAGLINE="guards the merge button"
 GOBLIN_EMOJI="👺"
 GOBLIN_REPO_URL="https://github.com/Kiril-P/merge-goblin"
+# Derived, never written twice: the update check asks GitHub for this repo's
+# brand.sh and compares the GOBLIN_VERSION it finds against the one above.
+GOBLIN_REPO_SLUG="${GOBLIN_REPO_URL#https://github.com/}"
 
 # Hidden HTML marker prefix. Every artifact the Goblin posts carries one of:
 #   <!-- goblin:review  {...} -->   the grouped review body

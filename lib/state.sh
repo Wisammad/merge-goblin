@@ -93,12 +93,16 @@ ledger_add()  { goblin_ensure_dirs; printf '%s\n' "$1" >> "$LEDGER" 2>/dev/null 
 # One precomputed blob the control panel reads, so the UI never has to shell out
 # per field. Refreshed by every writer.
 ui_state_write() {
-  local st stats running disabled
+  local st stats running disabled update
   st="$(cat "$STATUS" 2>/dev/null)"
   printf '%s' "$st" | jq -e . >/dev/null 2>&1 || st='{}'
   stats="$(compute_stats)"
   running=false; agent_running  >/dev/null 2>&1 && running=true
   disabled=false; agent_disabled >/dev/null 2>&1 && disabled=true
+  # Read the cached check; never perform one. This runs on every status write,
+  # including interactive ones, and must stay free of network calls.
+  update="$(cat "$UPDATE_STATE" 2>/dev/null)"
+  printf '%s' "$update" | jq -e . >/dev/null 2>&1 || update='{}'
 
   printf '%s' "$st" | jq \
     --argjson stats "$stats" \
@@ -113,9 +117,17 @@ ui_state_write() {
     --argjson enabled "$(cfg_get '.enabled' true)" \
     --argjson repos "$(cfg_get_json '[.repos[]? | {slug, enabled: (.enabled != false)}]' '[]')" \
     --argjson running "$running" --argjson disabled "$disabled" \
+    --argjson update "$update" \
     --argjson checkedAt "$(now_epoch)" '
     . + $stats + {
       goblin: {name: $name, version: $version},
+      update: {
+        # Re-derive against the running version: a stale "available" left over
+        # from before an upgrade must not keep nagging afterwards.
+        available: (($update.available // false) and (($update.latest // "") != $version)),
+        latest: ($update.latest // ""), checkedAt: ($update.checkedAt // 0),
+        url: ($update.url // "")
+      },
       provider: {id: $provider, model: $model},
       identity: {login: $login, ghActive: $ghActive, ok: ($login == "" or $login == $ghActive)},
       budgetCapUsd: $cap, snoozeUntil: $snoozeUntil, enabled: $enabled,

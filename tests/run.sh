@@ -660,6 +660,96 @@ test_engine_queue_is_oldest_first() {
   eq '[9,3]' "$out" || return 1
 }
 
+# ---------------------------------------------------------------- update ---
+test_update_version_compare() {
+  setup
+  . "$ROOT/lib/update.sh"
+  update_newer 0.4.1 0.4.0   || return 1
+  update_newer 0.5   0.4.9   || return 1   # a missing field counts as 0
+  update_newer 1.0.0 0.9.9   || return 1
+  update_newer 0.4.10 0.4.9  || return 1   # numeric, not a string compare
+  update_newer v0.4.2 0.4.1  || return 1   # tolerate a v prefix
+  update_newer 0.4.0 0.4.0   && return 1
+  update_newer 0.3.9 0.4.0   && return 1
+  update_newer 0.5.0-rc1 0.5.0 && return 1 # never nag anyone into a prerelease
+  update_newer "" 0.4.0      && return 1   # a failed lookup is not an update
+  teardown
+}
+
+test_update_flag_does_not_outlive_the_upgrade() {
+  setup
+  . "$ROOT/lib/update.sh"
+  update_remote_version() { printf '9.9.9'; }
+  update_check --force
+  eq "true"  "$(update_field '.available' x)" || return 1
+  eq "9.9.9" "$(update_available)"            || return 1
+  # Now the machine is running the version it was told about. A cached flag that
+  # survived an upgrade would nag forever, so it is re-derived on every read.
+  GOBLIN_VERSION="9.9.9"
+  update_available && return 1
+  teardown
+}
+
+test_update_check_is_throttled_and_silent_when_offline() {
+  setup
+  . "$ROOT/lib/update.sh"
+  local calls="$GOBLIN_HOME/calls"
+  update_remote_version() { echo x >> "$calls"; printf '9.9.9'; }
+  update_check                              # due — one lookup
+  update_check                              # throttled — no second lookup
+  eq "1" "$(wc -l < "$calls" | tr -d ' ')" || return 1
+  # An unreachable GitHub must never claim an update, and must still stamp the
+  # check: otherwise an offline Mac re-queries on every single scheduled run.
+  rm -f "$UPDATE_STATE"
+  update_remote_version() { printf ''; }
+  update_check --force
+  eq "false" "$(update_field '.available' x)"   || return 1
+  [ "$(update_field '.checkedAt' 0)" -gt 0 ]    || return 1
+  teardown
+}
+
+test_ui_state_carries_the_update_flag() {
+  setup
+  . "$ROOT/lib/update.sh"
+  update_remote_version() { printf '9.9.9'; }
+  update_check --force
+  status_set '{}'
+  # The panel reads only this cache, so the banner lives or dies by these keys.
+  eq "true"  "$(jq -r '.update.available' "$UISTATE")" || return 1
+  eq "9.9.9" "$(jq -r '.update.latest'    "$UISTATE")" || return 1
+  teardown
+}
+
+test_ui_parses_every_provider_row() {
+  setup
+  export ROOT
+  local py; py="$(. "$ROOT/lib/ui.sh"; ui_python)" \
+    || { echo "no python3 — skipping"; teardown; return 0; }
+  # Regression: run_bob returns stdout.strip(), so the FIRST row arrives without
+  # the two-space indent the others keep. Slicing a fixed-width line[2:] off it
+  # turned "claude" into "aude", and the panel's Claude button then shelled
+  # `provider use aude` — which the CLI rejects. Parse by marker, not by column.
+  # No __pycache__ in the tree: it would be a build artefact in a shell project.
+  PYTHONDONTWRITEBYTECODE=1 "$py" - <<'PY' || { teardown; return 1; }
+import importlib.util, os
+spec = importlib.util.spec_from_file_location(
+    "goblin_ui", os.path.join(os.environ["ROOT"], "share", "ui", "server.py"))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+rows = ("  claude  ready    team            cost: yes\n"
+        "  codex   missing\n"
+        "▸ cursor  ready    cursor          cost: n/a")
+m.run_bob = lambda *a, **k: {"ok": True, "code": 0, "out": rows.strip(), "err": ""}
+
+got = m.providers(force=True)
+assert [p["id"] for p in got] == ["claude", "codex", "cursor"], got
+assert [p["current"] for p in got] == [False, False, True], got
+assert [p["state"] for p in got] == ["ready", "missing", "ready"], got
+PY
+  teardown
+}
+
 printf '\n  goblin test suite\n\n'
 t "config: defaults"                     test_config_defaults
 t "config: corrupt file recovers"        test_config_corrupt_file_recovers
@@ -688,6 +778,11 @@ t "migrate: preserves ledger + events"   test_migrate_preserves_ledger_and_event
 t "ui: state cache is valid json"        test_ui_state_is_valid_json
 t "ui: serves, refuses bad token"        test_ui_serves_and_refuses_bad_token
 t "ui: action verbs are allowlisted"     test_ui_rejects_unlisted_verbs
+t "ui: every provider row parses"        test_ui_parses_every_provider_row
+t "ui: state carries update flag"        test_ui_state_carries_the_update_flag
+t "update: version compare"              test_update_version_compare
+t "update: flag clears after upgrade"    test_update_flag_does_not_outlive_the_upgrade
+t "update: throttled, silent offline"    test_update_check_is_throttled_and_silent_when_offline
 t "goblin: voice covers all verdicts"    test_goblin_voice_covers_every_verdict
 t "goblin: legacy markers matched"       test_legacy_markers_still_recognised
 t "render: counts never empty"           test_render_counts_is_never_empty

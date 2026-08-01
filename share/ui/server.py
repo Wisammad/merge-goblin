@@ -69,17 +69,24 @@ def providers(force=False):
     res = run_bob(["provider", "list"], timeout=30)
     out = []
     for line in res["out"].splitlines():
-        line = line.rstrip()
-        if not line.strip():
+        # Read the current-provider marker rather than slicing a fixed-width
+        # prefix off the front: run_bob strips stdout, so the first row arrives
+        # without its indent and a blind line[2:] ate two letters of its name.
+        line = line.strip()
+        if not line:
             continue
-        parts = line[2:].split()
+        current = line.startswith("▸")
+        if current:
+            line = line[1:].lstrip()
+        parts = line.split()
         if not parts:
             continue
+        rest = " ".join(parts[1:])
         out.append({
             "id": parts[0],
-            "current": line.startswith("▸"),
-            "state": "ready" if " ready" in line else ("no auth" if "no auth" in line else "missing"),
-            "detail": " ".join(parts[1:]),
+            "current": current,
+            "state": "ready" if rest.startswith("ready") else ("no auth" if rest.startswith("no auth") else "missing"),
+            "detail": rest,
         })
     with _lock:
         _cache["providers"] = out

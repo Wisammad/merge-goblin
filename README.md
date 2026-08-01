@@ -45,6 +45,11 @@ git clone https://github.com/Kiril-P/merge-goblin.git && cd merge-goblin
 The installer asks which account to review as, which subscription to use, and which repo to
 watch, then schedules him and installs the control panel. Re-run it any time to upgrade.
 
+Upgrading is always those two commands — `git pull && ./install.sh`. The Goblin checks once a
+day whether a newer version exists and says so in the panel, in `goblin doctor` and in the log,
+but he never installs it himself: that would mean rewriting the code mid-run and reloading the
+scheduler behind your back. Turn the check off with `goblin config set .update.notify false`.
+
 ```bash
 brew install gh jq                      # if you need them
 ```
@@ -81,6 +86,8 @@ goblin budget 5                # stop after $5/day
 goblin provider list           # which subscriptions are ready
 goblin provider use codex      # switch who does the reviewing
 goblin repos add owner/name    # watch another repo
+
+goblin update                  # is there a newer Goblin? (tells you; installs nothing)
 ```
 
 Start with **`goblin run --plan`**. It assembles the real prompt and shows you the diff,

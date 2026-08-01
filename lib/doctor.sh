@@ -44,6 +44,7 @@ cmd_doctor() {
   doctor_agent
   doctor_menu
   doctor_state
+  doctor_update
 
   if [ "$DOC_AS_JSON" = true ]; then
     jq -nc --argjson checks "$DOC_JSON" --argjson p "$DOC_PASS" --argjson w "$DOC_WARN" --argjson f "$DOC_FAIL" \
@@ -222,5 +223,22 @@ doctor_state() {
     _doc ok "last run" "$(date -r "$last" '+%Y-%m-%d %H:%M')"
   else
     _doc ok "last run" "never"
+  fi
+}
+
+# Someone running `doctor` is asking to be told what's wrong, so force the check
+# rather than waiting for the daily one — this is the surface where a stale
+# install should become obvious.
+doctor_update() {
+  . "$LIB_DIR/update.sh"
+  update_check --force
+  local newer
+  if newer="$(update_available)"; then
+    _doc warn version "v$GOBLIN_VERSION — v$newer is out" "$(update_instructions)"
+  elif [ -z "$(update_field '.latest' '')" ]; then
+    # Could not reach GitHub. Not a problem with this install; don't cry wolf.
+    _doc ok version "v$GOBLIN_VERSION · update check unavailable"
+  else
+    _doc ok version "v$GOBLIN_VERSION is current"
   fi
 }

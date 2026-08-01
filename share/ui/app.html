@@ -290,6 +290,10 @@ let S = null, busy = false, dirty = false;
 
 const $ = id => document.getElementById(id);
 const money = n => "$" + (Math.round((n || 0) * 100) / 100).toFixed(2);
+// Every banner below is built with innerHTML, so anything interpolated into one
+// goes through here first.
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 function toast(msg, bad) {
   const t = $("toast");
@@ -358,6 +362,13 @@ function render() {
     B.push(`<div class="banner warn"><div>⏻</div><div class="grow"><b>The Goblin has left his post</b>
       <div class="hint">Nothing is reviewed until you put him back on duty.</div></div>
       <button class="small primary" onclick="act('on')">Turn on</button></div>`);
+  // Notify only — there is no button here on purpose. Applying an update
+  // rewrites the running code and reloads launchd; that stays a human's call.
+  const up = st.update || {};
+  if (up.available && up.latest)
+    B.push(`<div class="banner"><div>⬆️</div><div class="grow"><b>Version ${esc(up.latest)} is out</b>
+      <div class="hint">You're on ${esc((st.goblin || {}).version || "?")}. To update, run
+      <code>git pull &amp;&amp; ./install.sh</code> in your goblin clone.</div></div></div>`);
   $("banners").innerHTML = B.join("");
 
   $("power").checked = !off;

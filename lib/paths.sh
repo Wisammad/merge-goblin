@@ -15,6 +15,7 @@ EVENTS="$GOBLIN_HOME/events.jsonl"
 LEDGER="$GOBLIN_HOME/ledger"            # "<pr>:<headSha>" lines, one per reviewed commit
 LOG="$GOBLIN_HOME/$GOBLIN_SLUG.log"
 UIURL="$GOBLIN_HOME/ui.url"             # where a running control panel is listening
+UPDATE_STATE="$GOBLIN_HOME/update.json" # last version check; see update.sh
 LOCKDIR="$GOBLIN_HOME/.lock"
 REPOS_DIR="$GOBLIN_HOME/repos"          # scratch clones: repos/<owner>__<name>
 RUNTMP="$GOBLIN_HOME/tmp"
