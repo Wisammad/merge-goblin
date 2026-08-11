@@ -109,6 +109,13 @@ events_append() {
 ledger_has()  { grep -qxF "$1" "$LEDGER" 2>/dev/null; }
 ledger_add()  { goblin_ensure_dirs; printf '%s\n' "$1" >> "$LEDGER" 2>/dev/null || true; }
 
+# Repository-scoped for cross-repo watching. The legacy fallback keeps existing
+# installs from forgetting reviews recorded before the repo was part of the key.
+ledger_reviewed() {
+  local repo="$1" pr="$2" head="$3"
+  ledger_has "${repo}#${pr}:${head}" || ledger_has "${pr}:${head}"
+}
+
 # --- UI state cache --------------------------------------------------------
 
 # Is this install actually set up? DERIVED, not just read from the flag.

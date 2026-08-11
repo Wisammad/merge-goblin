@@ -83,18 +83,32 @@ run_with_timeout() {
 
 # Single-instance lock. Stale after 3h (a review can legitimately take minutes).
 lock_acquire() {
-  if [ -d "$LOCKDIR" ]; then
-    if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +180 2>/dev/null)" ]; then
+  local dir="${1:-$LOCKDIR}"
+  if [ -d "$dir" ]; then
+    if [ -n "$(find "$dir" -maxdepth 0 -mmin +180 2>/dev/null)" ]; then
       log "removing stale lock"
-      rmdir "$LOCKDIR" 2>/dev/null || rm -rf "$LOCKDIR"
+      rmdir "$dir" 2>/dev/null || rm -rf "$dir"
     else
       return 1
     fi
   fi
-  mkdir "$LOCKDIR" 2>/dev/null || return 1
+  mkdir "$dir" 2>/dev/null || return 1
   return 0
 }
-lock_release() { rmdir "$LOCKDIR" 2>/dev/null || true; }
+lock_release() { rmdir "${1:-$LOCKDIR}" 2>/dev/null || true; }
+
+# Exact-PR audits can run together, but never twice for the same PR. The global
+# run lock still serializes scheduled and repo-wide scans.
+PR_LOCKDIR=""
+pr_lock_acquire() {
+  local dir="$PR_LOCKS_DIR/$(goblin_hash "$1#$2")"
+  lock_acquire "$dir" || return 1
+  PR_LOCKDIR="$dir"
+}
+pr_lock_release() {
+  [ -n "$PR_LOCKDIR" ] && lock_release "$PR_LOCKDIR"
+  PR_LOCKDIR=""
+}
 
 # Stable short hash of a string (used for finding ids and fleet assignment).
 goblin_hash() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-12; }

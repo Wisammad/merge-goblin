@@ -59,7 +59,7 @@ provider_cursor_review() {
   ) || rc=$?
 
   GOBLIN_P_DURATION_MS=$(( ($(now_epoch) - t0) * 1000 ))
-  GOBLIN_P_MODEL="${model:-cursor-default}"
+  GOBLIN_P_MODEL="${model:-cursor-auto}"
   GOBLIN_P_COST_KNOWN=false; GOBLIN_P_COST_USD=0
   GOBLIN_P_TOKENS_IN=0; GOBLIN_P_TOKENS_OUT=0; GOBLIN_P_TURNS=0
 

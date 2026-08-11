@@ -24,6 +24,44 @@ gh_prs() {
   jq -e 'type == "array"' "$out" >/dev/null 2>&1 || { echo '[]' > "$out"; return 1; }
 }
 
+# gh_user_prs <login> <out.json>
+# Find open PRs authored by one user across every repository visible to the
+# active GitHub account. Search supplies repo/number pairs; the pull endpoint
+# supplies the current head and the same normalized shape as gh_prs.
+gh_user_prs() {
+  local login="$1" out="$2" search="$RUNTMP/user-pr-search-$$.json" rows="$out.rows"
+  : > "$rows"
+
+  gh api --paginate --slurp -X GET search/issues \
+    -f q="is:pr is:open archived:false author:$login" -f per_page=100 \
+    > "$search" 2>/dev/null || { echo '[]' > "$out"; rm -f "$search" "$rows"; return 1; }
+
+  jq -r '
+    (if type == "array" then [.[].items[]?] else [.items[]?] end)[]
+    | [(.repository_url | split("/") | .[-2:] | join("/")), (.number | tostring)]
+    | @tsv' "$search" 2>/dev/null \
+  | while IFS="$(printf '\t')" read -r slug pr; do
+      [ -n "$slug" ] && [ -n "$pr" ] || continue
+      gh api "repos/$slug/pulls/$pr" 2>/dev/null \
+      | jq -c --arg repo "$slug" '{
+          repo: $repo, number, head: .head.sha, draft: (.draft // false),
+          title, url: .html_url, base: .base.ref, author: (.user.login // ""),
+          updatedAt: (.updated_at | fromdateiso8601? // 0),
+          createdAt: (.created_at | fromdateiso8601? // 0),
+          requested: (
+            [ .requested_reviewers[]? | {kind:"user", key:(.login // "")} ] +
+            [ .requested_teams[]? | {kind:"team", key:((.organization.login // "") + "/" + (.slug // .name // ""))} ]
+            | map(select(.key != "" and .key != "/"))
+          )
+        }' >> "$rows" 2>/dev/null
+    done
+
+  jq -s 'unique_by(.repo + "#" + (.number | tostring))' "$rows" > "$out" 2>/dev/null \
+    || echo '[]' > "$out"
+  rm -f "$search" "$rows" 2>/dev/null
+  jq -e 'type == "array"' "$out" >/dev/null 2>&1
+}
+
 # Expand a team slug to member logins, cached for a day (read:org scope needed).
 gh_team_members() {
   local org_team="$1" cache="$GOBLIN_HOME/teams.json" org slug now
@@ -66,8 +104,17 @@ gh_pr_is_open() {
 # gh_pr_meta <slug> <pr> <out.json> — body + head sha for the prompt.
 gh_pr_meta() {
   gh api "repos/$1/pulls/$2" \
-    --jq '{number, title, body, base: .base.ref, head: .head.sha, author: .user.login, url: .html_url}' \
+    --jq '{number, title, body, base: .base.ref, head: .head.sha, headRef: .head.ref, author: .user.login, url: .html_url}' \
     > "$3" 2>/dev/null
+}
+
+# Evidence used only to identify a coding-agent contributor. Commit trailers are
+# strongest; PR text and branch names catch agents that disclose elsewhere.
+gh_pr_agent_evidence() {
+  local slug="$1" pr="$2" prjson="$3" out="$4"
+  jq -r '.title // "", .body // "", .headRef // ""' "$prjson" 2>/dev/null > "$out"
+  gh api --paginate "repos/$slug/pulls/$pr/commits?per_page=100" \
+    --jq '.[].commit.message' >> "$out" 2>/dev/null || true
 }
 
 # gh_prior_review <slug> <pr> — the most recent review marker on this PR, or empty.

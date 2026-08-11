@@ -12,12 +12,13 @@ CONFIG="$GOBLIN_HOME/config.json"
 STATUS="$GOBLIN_HOME/status.json"
 UISTATE="$GOBLIN_HOME/uistate.json"
 EVENTS="$GOBLIN_HOME/events.jsonl"
-LEDGER="$GOBLIN_HOME/ledger"            # "<pr>:<headSha>" lines, one per reviewed commit
+LEDGER="$GOBLIN_HOME/ledger"            # "<repo>#<pr>:<headSha>" lines, one per reviewed commit
 LOG="$GOBLIN_HOME/$GOBLIN_SLUG.log"
 UIURL="$GOBLIN_HOME/ui.url"             # where a running control panel is listening
 UPDATE_STATE="$GOBLIN_HOME/update.json" # last version check; see update.sh
 INBOX="$GOBLIN_HOME/inbox.json"         # waiting-PR counts for the menu bar; see inbox.sh
 LOCKDIR="$GOBLIN_HOME/.lock"
+PR_LOCKS_DIR="$GOBLIN_HOME/pr-locks"
 REPOS_DIR="$GOBLIN_HOME/repos"          # scratch clones: repos/<owner>__<name>
 RUNTMP="$GOBLIN_HOME/tmp"
 
@@ -50,7 +51,7 @@ AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 
 
 goblin_ensure_dirs() {
-  mkdir -p "$GOBLIN_HOME" "$REPOS_DIR" "$RUNTMP" 2>/dev/null || true
+  mkdir -p "$GOBLIN_HOME" "$PR_LOCKS_DIR" "$REPOS_DIR" "$RUNTMP" 2>/dev/null || true
   # 700, not 755: this directory holds PR titles, spend history and raw model
   # output under last-failure/. On a shared Mac every other user could read it.
   chmod 700 "$GOBLIN_HOME" 2>/dev/null || true

@@ -6,8 +6,8 @@
 # model chokes on, a provider that is signed out, an oversized PR — were retried
 # every interval, forever, at full price, with a notification each time.
 #
-# State lives in ~/.goblin/attempts.json, keyed "<pr>:<headSha>":
-#   { "1234:abc123": { "n": 2, "lastAt": 1785, "nextAt": 1785+3600, "kind": "other" } }
+# State lives in ~/.goblin/attempts.json, keyed "<repo>#<pr>:<headSha>".
+# The two-argument form remains for state written by older installs.
 #
 # Keying on the head sha means a new push resets the counter for free: the key
 # simply does not exist yet. That is the behaviour you want — a push is exactly
@@ -29,7 +29,15 @@ attempt_file() { printf '%s/attempts.json' "$GOBLIN_HOME"; }
 # The one place the key shape is written down. engine.sh and the panel disagreed
 # about it once, which meant the panel reported nothing blocked while the engine
 # was backing off every PR.
-attempt_key() { printf '%s:%s' "$1" "$2"; }
+attempt_key() {
+  if [ "$#" -ge 3 ]; then
+    if [ -n "$1" ]; then printf '%s#%s:%s' "$1" "$2" "$3"
+    else printf '%s:%s' "$2" "$3"
+    fi
+  else
+    printf '%s:%s' "$1" "$2"
+  fi
+}
 
 attempt_blocked() {
   local key="$1" f; f="$(attempt_file)"
@@ -102,7 +110,8 @@ attempt_stuck_json() {
     [ to_entries[]
       | select((.value.n // 0) >= $maxa)
       | select((.value.nextAt // 0) > $now)
-      | { number: ((.key | split(":") | .[0] | tonumber?) // 0),
+      | { number: ((.key | split(":") | .[0] | split("#") | last | tonumber?) // 0),
+          repo:   ((.key | split(":") | .[0] | split("#") | if length > 1 then .[0] else "" end)),
           head:   ((.key | split(":") | .[1]) // ""),
           n:      (.value.n // 0),
           kind:   (.value.kind // ""),
