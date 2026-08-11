@@ -10,6 +10,8 @@
 #   goblin doctor          check everything and print fixes
 #   goblin run --pr 123    review one PR now
 #   goblin run --plan      dry run: show what it would post, post nothing
+#   goblin --auto [repo]   watch your PR heads everywhere, or in one repo
+#   goblin <PR_URL>        review that GitHub PR now
 #   goblin off / on        master switch (survives reboot)
 #
 # See `goblin help` for the full surface.
@@ -57,6 +59,8 @@ $GOBLIN_EMOJI $GOBLIN_NAME v$GOBLIN_VERSION — $GOBLIN_TAGLINE
   goblin doctor [--fix] [--json]      diagnose everything; --fix repairs the safe ones
   goblin run [--pr N] [--repo SLUG]   review now
           [--plan] [--force]       --plan = dry run (posts nothing)
+  goblin --auto [OWNER/REPO]          watch your open PRs and review each new head
+  goblin https://github.com/O/R/pull/N review that PR now
   goblin on | off                     master switch (off survives reboot)
   goblin pause | resume | toggle      temporary stop (agent stays scheduled)
   goblin snooze 1h|tomorrow|<secs>|clear
@@ -76,6 +80,7 @@ EOF
 cmd="${1:-status}"; shift 2>/dev/null || true
 
 case "$cmd" in
+  --auto)   . "$LIB_DIR/engine.sh";      cmd_auto "$@" ;;
   status)   . "$LIB_DIR/cmd_status.sh";  cmd_status "$@" ;;
   doctor)   . "$LIB_DIR/doctor.sh";      cmd_doctor "$@" ;;
   run)      . "$LIB_DIR/engine.sh";      cmd_run "$@" ;;
@@ -92,6 +97,8 @@ case "$cmd" in
   update)   . "$LIB_DIR/update.sh";      cmd_update "$@" ;;
   version)  echo "$GOBLIN_NAME $GOBLIN_VERSION" ;;
   help|-h|--help) usage ;;
+  https://github.com/*/pull/*)
+            . "$LIB_DIR/engine.sh";      cmd_url "$cmd" ;;
   # everything else is a small control verb
   on|off|pause|resume|toggle|toggle-power|snooze|budget|repos|provider|fleet|config|log|agent|fix-account|\
   run-now|snooze1h|snoozetomorrow|clearsnooze|budgetoff|budget2|budget5|budget10|set-budget|disable-agent|enable-agent)

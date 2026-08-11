@@ -13,6 +13,8 @@
 #   GH_FAKE_DIR      directory of canned responses
 #   GH_FAKE_USER     login that `gh api user` and `gh auth token` resolve to
 #   GH_FAKE_PRS      file whose contents `gh pr list` returns
+#   GH_FAKE_SEARCH   file returned by `gh api search/issues`
+#   GH_FAKE_PULLS_DIR  files named owner__repo__PR.json for pull metadata
 #   GH_FAKE_REFS     newline list of refs `git/matching-refs/...` returns
 #   GH_FAKE_STATUS_POST_REFS   http code for POST git/refs (default 201)
 #
@@ -25,7 +27,16 @@
 case "${1:-}" in
   auth)
     case "${2:-}" in
-      token)  printf 'gho_faketoken\n'; exit 0 ;;
+      token)
+        # `gh auth token --user X` exits non-zero for an account gh has no
+        # credential for. doctor_identity branches on exactly that, so the fake
+        # has to draw the same line instead of handing out a token for any name.
+        u=""
+        while [ $# -gt 0 ]; do
+          case "$1" in -u|--user) u="${2:-}"; shift 2 ;; *) shift ;; esac
+        done
+        [ -n "$u" ] && [ "$u" != "${GH_FAKE_USER:-me}" ] && exit 1
+        printf 'gho_faketoken\n'; exit 0 ;;
       status) printf 'Logged in to github.com account %s\n' "${GH_FAKE_USER:-me}"; exit 0 ;;
       *) exit 0 ;;
     esac ;;
@@ -66,6 +77,13 @@ if [ "${1:-}" = "api" ]; then
   case "$path" in
     user)
       printf '{"login":"%s"}\n' "${GH_FAKE_USER:-me}"; exit 0 ;;
+    search/issues)
+      if [ -n "${GH_FAKE_SEARCH:-}" ] && [ -f "$GH_FAKE_SEARCH" ]; then
+        cat "$GH_FAKE_SEARCH"
+      else
+        printf '{"items":[]}\n'
+      fi
+      exit 0 ;;
     *git/matching-refs/*)
       if [ -n "${GH_FAKE_REFS:-}" ]; then
         printf '%s\n' "$GH_FAKE_REFS" | grep . | while IFS= read -r r; do
@@ -74,6 +92,12 @@ if [ "${1:-}" = "api" ]; then
       fi
       exit 0 ;;
     repos/*/pulls/*/reviews) printf '\n'; exit 0 ;;
+    repos/*/pulls/*)
+      if [ -n "${GH_FAKE_PULLS_DIR:-}" ]; then
+        pull_key="$(printf '%s' "$path" | sed 's|^repos/||; s|/pulls/|__|; s|/|__|g').json"
+        [ -f "$GH_FAKE_PULLS_DIR/$pull_key" ] && { cat "$GH_FAKE_PULLS_DIR/$pull_key"; exit 0; }
+      fi
+      exit 0 ;;
     repos/*/commits/*) printf 'anchorsha000000\n'; exit 0 ;;
     repos/*)
       # `gh api repos/o/n --jq .default_branch`

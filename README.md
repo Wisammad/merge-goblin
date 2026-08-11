@@ -6,6 +6,11 @@ He watches for PRs where you're a requested reviewer, reads the repo's *own* rev
 guidelines, and posts one clearly-labelled automated review with line-anchored comments —
 plus a second comment answering "does this actually do what the ticket asked?"
 
+Commit signatures identify whether Claude, Codex, or Cursor contributed the code. The other
+two agents then review independently in parallel, and the GitHub review names the contributor
+signal and both reviewer/model routes. With no recognized signature, the fallback is Claude
+Opus 5 plus the configured companion provider (OpenAI Codex by default).
+
 > ### The Goblin refuses the merge.
 > `claude/sonnet` · inspected `aa309fb` — 12 files, +1976 −296 against `main`
 >
@@ -19,9 +24,8 @@ your account — nothing is sent anywhere except to the AI CLI you already use.
 ## Why
 
 Hosted review bots are per-seat and send your code to another vendor. Meanwhile your team
-already has Claude, ChatGPT and Cursor seats sitting there. The Goblin drives whichever of those
-CLIs you're signed into, so a review costs nothing beyond the subscription you're already
-paying for — and switching provider is one click.
+already has Claude, ChatGPT and Cursor seats sitting there. The Goblin drives two of those CLIs
+in parallel, so a review costs nothing beyond the subscriptions you're already paying for.
 
 - **Your subscription, not an API key.** `claude`, `codex` or `cursor-agent`, whichever is installed.
 - **One review, not twenty notifications.** All findings in a single grouped review.
@@ -88,6 +92,10 @@ The CLI does the same things, if you prefer:
 goblin status                  # where things stand
 goblin run --plan              # dry run: show exactly what would be posted, post nothing
 goblin run --pr 123            # review one PR right now
+goblin --auto                  # watch your open PRs everywhere; review each new head
+goblin --auto owner/name       # same watcher, limited to one repo
+goblin https://github.com/owner/name/pull/123  # review that PR immediately
+goblin run --repo owner/name --force           # review every open PR in one repo, now
 goblin doctor                  # diagnose anything odd (--fix repairs the safe stuff)
 
 goblin off / goblin on            # master switch (off survives reboots)
@@ -95,7 +103,7 @@ goblin snooze 1h               # temporary quiet
 goblin budget 5                # stop after $5/day
 
 goblin provider list           # which subscriptions are ready
-goblin provider use codex      # switch who does the reviewing
+goblin provider use codex      # choose the companion for unknown-contributor fallback
 goblin repos add owner/name    # watch another repo
 
 goblin update                  # is there a newer Goblin? (tells you; installs nothing)
@@ -103,6 +111,21 @@ goblin update                  # is there a newer Goblin? (tells you; installs n
 
 Start with **`goblin run --plan`**. It assembles the real prompt and shows you the diff,
 the review rules it found and the lines it can comment on — without calling a model.
+
+`goblin --auto` is a foreground watcher: leave it running and stop it with Ctrl-C. It
+looks only at PRs authored by your configured GitHub user, across every repository that
+account can see. Each distinct PR head is reviewed once. Set `GOBLIN_WATCH_INTERVAL`
+to change the 30-second check interval. `--auto owner/name` limits the same user-scoped
+watch to one repository.
+
+To review one PR right now, paste its GitHub URL straight after `goblin` — the link
+from your browser's address bar, tracking parameters and `#files` anchor included. It
+runs immediately, regardless of the automatic scope. For a whole repository at once,
+`goblin run --repo owner/name --force`.
+
+Exact-PR audits can run concurrently in separate terminals. Different PRs use isolated
+temporary checkouts; a second audit of the same PR is skipped to prevent duplicate reviews.
+Parallel audits can consume AI-provider quota faster than sequential reviews.
 
 ## What he posts
 
@@ -195,15 +218,16 @@ he also caps **reviews per run**. Everything is visible in the panel and `goblin
 launchd ──▶ goblin run ──▶ pick PRs ──▶ assign ──▶ claim (git ref)
                                                     │
                        repo's review rules ─┐       ▼
-                       annotated diff ──────┼──▶ your AI CLI ──▶ findings JSON
-                       linked issue ────────┘                        │
-                                                                     ▼
+                       annotated diff ──────┼──▶ two reviewer CLIs ──▶ merged findings JSON
+                       linked issue ────────┘                              │
+                                                                           ▼
                                           validate ▸ drop unpostable lines ▸
                                           one grouped review + intent comment
 ```
 
-The model never touches GitHub — it runs read-only with no tools and returns JSON. The
-Goblin does the posting. That's what makes providers swappable and the verdict safe.
+The reviewers never receive GitHub credentials and return JSON; the Goblin alone does the
+posting. Each parallel reviewer gets an isolated temporary checkout, so a tool-capable CLI
+cannot affect the other review.
 
 State lives in `~/.goblin/`: `config.json`, `events.jsonl` (history and spend), `ledger`
 (what's been reviewed), `repos/` (scratch clones), `goblin.log`.

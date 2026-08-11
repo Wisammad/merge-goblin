@@ -44,16 +44,16 @@ inbox_classify() {
     state=draft
   elif [ -z "$eligible" ]; then
     state=not_ours
-  elif ledger_has "${pr}:${head}"; then
+  elif ledger_reviewed "${INBOX_REPO:-}" "$pr" "$head"; then
     state=reviewed
   elif [ -n "$human_reviewers" ]; then
     # Checked before the backoff and assignment states on purpose: "a person has
     # this" outranks every internal reason we might have had for skipping it.
     state=reviewed_by_other
     reason="reviewed by $human_reviewers"
-  elif attempt_blocked "$(attempt_key "$pr" "$head")"; then
+  elif attempt_blocked "$(attempt_key "${INBOX_REPO:-}" "$pr" "$head")"; then
     state=blocked
-    reason="$(attempt_reason "$(attempt_key "$pr" "$head")")"
+    reason="$(attempt_reason "$(attempt_key "${INBOX_REPO:-}" "$pr" "$head")")"
   elif [ "$mine" != true ]; then
     state=assigned_elsewhere
   else

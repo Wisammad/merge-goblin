@@ -40,7 +40,9 @@ _panel_slug() {
 }
 
 _panel_login() {
-  printf '%s' "$1" | grep -qE '^[A-Za-z0-9-]{1,39}$' || return 1
+  # Alnum or single hyphens, never leading/trailing — see install.sh: one login
+  # rule, shared with app/Command.swift.
+  printf '%s' "$1" | grep -qE '^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}$' || return 1
   printf '%s' "$1"
 }
 

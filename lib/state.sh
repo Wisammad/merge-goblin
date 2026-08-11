@@ -74,11 +74,93 @@ today_review_count() {
   if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
 }
 
+# reservation_try/_release/_count — an in-flight review slot, counted toward
+# maxReviewsPerDay until this review posts (or fails) and a real
+# events.jsonl entry takes over.
+#
+# Exact-PR audits now run concurrently on purpose (see pr_lock_acquire in
+# core.sh). checking the cap and reserving a slot as two SEPARATELY locked
+# steps (an earlier version of this fix) left the exact race it was meant to
+# close: two processes could both recompute "0 remaining" before either had
+# reserved anything, both pass, and only then both reserve — exceeding the
+# cap by however many raced past the check together. reservation_try folds
+# the recount and the reserve into one locked critical section, so only as
+# many processes as the cap allows ever see success. The dollar cap keeps
+# its pre-existing imprecision (this run's own cost is not known until the
+# model call returns, same as the single-process case always had).
+RESERVATION_ID=""
+
+# reservation_try <id> <max_day> — <=0 means unlimited. Returns success and
+# records the reservation when under the cap; returns failure, having
+# recorded nothing, when at or over it.
+reservation_try() {
+  local id="$1" max_day="${2:-0}" f="$RESERVATIONS" locked=false posted reserved ok=false
+  goblin_ensure_dirs
+  goblin_state_lock reservations && locked=true
+  [ -s "$f" ] || echo '{}' > "$f"
+  posted="$(today_review_count)"
+  reserved="$(reservation_count)"
+  if [ "${max_day:-0}" -le 0 ] 2>/dev/null \
+     || [ "$(( ${posted:-0} + ${reserved:-0} ))" -lt "$max_day" ] 2>/dev/null; then
+    # Only under the cap AND the write itself actually landed — jq/mv can
+    # fail (disk full, permissions), and reporting success while
+    # reservations.json was never actually updated would let the caller
+    # proceed believing it holds a slot no other process can see.
+    if jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
+         && mv "$f.tmp" "$f"; then
+      RESERVATION_ID="$id"
+      ok=true
+    fi
+  fi
+  [ "$locked" = true ] && goblin_state_unlock reservations
+  [ "$ok" = true ]
+}
+
+# reservation_release [id] — defaults to whatever this process last reserved.
+# Safe to call even when nothing was ever reserved (budget denied before
+# reservation_try ran) or when it was already released.
+reservation_release() {
+  local id="${1:-$RESERVATION_ID}" f="$RESERVATIONS" locked=false
+  [ -n "$id" ] || return 0
+  [ -s "$f" ] || { [ "$id" = "$RESERVATION_ID" ] && RESERVATION_ID=""; return 0; }
+  goblin_state_lock reservations && locked=true
+  jq --arg id "$id" 'del(.[$id])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  [ "$locked" = true ] && goblin_state_unlock reservations
+  # This bookkeeping check must not become the function's own return value —
+  # releasing an id that is not the currently-tracked one (or releasing twice)
+  # is still a successful no-op, not a failure.
+  [ "$id" = "$RESERVATION_ID" ] && RESERVATION_ID=""
+  return 0
+}
+
+# reservation_count — live reservations. One older than goblin_max_review_secs
+# is treated as abandoned by a process that crashed before releasing it — a
+# fixed window here would, at a long configured timeoutSecs, expire the
+# reservation for a review that is still legitimately running and let a
+# second audit through, exactly the overrun this mechanism exists to prevent.
+reservation_count() {
+  local f="$RESERVATIONS" out cutoff
+  [ -s "$f" ] || { printf '0'; return 0; }
+  cutoff=$(( $(now_epoch) - $(goblin_max_review_secs) ))
+  out="$(jq -r --argjson cutoff "$cutoff" \
+    '[to_entries[] | select((.value.at // 0) >= $cutoff)] | length' "$f" 2>/dev/null)"
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
+}
+
 # status_set '<json patch>' — merge patch over current status, refresh stats,
 # write atomically, then refresh the UI state cache.
 status_set() {
   local patch="${1:-\{\}}" cur stats
   goblin_ensure_dirs
+  # Exact-PR audits run concurrently on purpose and each one patches this same
+  # file (e.g. "reviewing #N" then "idle"). Read-patch-write through a fixed
+  # temp path is not safe under that: two audits can both read the pre-patch
+  # snapshot, and whichever mv's last wins with a patch that never saw the
+  # other's — see goblin_state_lock in core.sh. That lock can time out and
+  # return failure while another process still holds it, so only unlock when
+  # this call actually acquired it — unlocking unconditionally would rmdir the
+  # other process's lock mid-write.
+  local locked=false; goblin_state_lock status && locked=true
   cur="$(cat "$STATUS" 2>/dev/null)"
   if ! printf '%s' "$cur" | jq -e . >/dev/null 2>&1; then
     cur='{"schemaVersion":1,"state":"idle","pausedReason":"","activity":"","lastRunStarted":0,"lastRunFinished":0,"nextRunEstimate":0}'
@@ -87,9 +169,11 @@ status_set() {
   if printf '%s' "$cur" | jq --argjson patch "$patch" --argjson stats "$stats" \
        '. + $patch + $stats | .schemaVersion = 1' > "$STATUS.tmp" 2>/dev/null; then
     mv "$STATUS.tmp" "$STATUS"
+    [ "$locked" = true ] && goblin_state_unlock status
     ui_state_write
   else
     rm -f "$STATUS.tmp" 2>/dev/null
+    [ "$locked" = true ] && goblin_state_unlock status
   fi
 }
 
@@ -108,6 +192,13 @@ events_append() {
 
 ledger_has()  { grep -qxF "$1" "$LEDGER" 2>/dev/null; }
 ledger_add()  { goblin_ensure_dirs; printf '%s\n' "$1" >> "$LEDGER" 2>/dev/null || true; }
+
+# Repository-scoped for cross-repo watching. The legacy fallback keeps existing
+# installs from forgetting reviews recorded before the repo was part of the key.
+ledger_reviewed() {
+  local repo="$1" pr="$2" head="$3"
+  ledger_has "${repo}#${pr}:${head}" || ledger_has "${pr}:${head}"
+}
 
 # --- UI state cache --------------------------------------------------------
 

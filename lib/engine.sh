@@ -7,6 +7,7 @@
 # shellcheck source=providers.sh
 . "$LIB_DIR/providers.sh"
 . "$LIB_DIR/findings.sh"
+. "$LIB_DIR/reviewers.sh"
 . "$LIB_DIR/github.sh"
 . "$LIB_DIR/render.sh"
 . "$LIB_DIR/post.sh"
@@ -17,14 +18,17 @@
 . "$LIB_DIR/attempts.sh"
 . "$LIB_DIR/inbox.sh"
 
-ONLY_PR=""; ONLY_REPO=""; DRY_RUN=false; FORCE=false; SCHEDULED=false
+ONLY_PR=""; ONLY_REPO=""; AUTHOR_SCOPE=""; DRY_RUN=false; FORCE=false; SCHEDULED=false
 REVIEWS_THIS_RUN=0
+RUN_LOCK_HELD=false
+ACTIVE_CHECKOUT=""
 
 cmd_run() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --pr)        ONLY_PR="$2"; shift 2 ;;
       --repo)      ONLY_REPO="$2"; shift 2 ;;
+      --author)    AUTHOR_SCOPE="$2"; shift 2 ;;
       --plan|--dry-run) DRY_RUN=true; shift ;;
       --force)     FORCE=true; shift ;;
       --scheduled) SCHEDULED=true; shift ;;
@@ -36,37 +40,43 @@ cmd_run() {
   # Only the scheduled path writes to the log file; interactive runs print.
   [ "$SCHEDULED" = true ] && log_open
 
-  if ! lock_acquire; then log "another run is active, exiting"; return 0; fi
-  trap 'claim_release; claim_release_comment; lock_release' EXIT INT TERM
+  # Exact-PR audits use their own PR lock inside engine_pr. Everything that can
+  # fan out across a repository keeps the global lock.
+  if [ -z "$ONLY_PR" ]; then
+    if ! lock_acquire; then log "another run is active, exiting"; return 0; fi
+    RUN_LOCK_HELD=true
+  fi
+  # reservation_release here is a crash-safety net, not the primary release —
+  # the per-PR loops in engine_repo/engine_user_scope release explicitly after
+  # every PR so a sweep never holds one PR's slot into the next.
+  trap 'claim_release; claim_release_comment; engine_checkout_release; pr_lock_release; reservation_release; engine_run_lock_release' EXIT INT TERM
 
   log "=== run start ${ONLY_PR:+(pr #$ONLY_PR) }${DRY_RUN:+}$([ "$DRY_RUN" = true ] && echo '(dry run)')"
 
-  engine_gates || { lock_release; return 0; }
-  engine_auth  || { lock_release; return 1; }
+  engine_gates || { engine_run_lock_release; return 0; }
+  engine_auth  || { engine_run_lock_release; return 1; }
 
-  local provider
-  # Load the adapters in THIS shell. providers_pick also loads them, but it runs
-  # inside a command substitution — a subshell — so its sourcing is discarded and
-  # provider_<name>_review would not exist by the time the engine calls it.
+  local provider="orchestrated"
+  # Load every adapter in THIS shell: contributor-aware reviews select two per PR.
   providers_load
-  provider="$(providers_pick)" || {
-    log "no usable provider (run: goblin provider list)"
-    status_set '{"state":"error","activity":"no usable AI provider"}'
-    return 1
-  }
-  log "provider: $provider"
+  log "review mode: contributor-aware parallel reviewers"
 
   local slug repos
-  repos="$(cfg_repos_enabled)"
-  [ -n "$ONLY_REPO" ] && repos="$ONLY_REPO"
-  if [ -z "$repos" ]; then
-    log "no repos configured — run: goblin repos add owner/name"
-    return 0
-  fi
+  if [ -n "$AUTHOR_SCOPE" ] && [ -z "$ONLY_REPO" ]; then
+    engine_user_scope "$AUTHOR_SCOPE" "$provider"
+    repos=""
+  else
+    repos="$(cfg_repos_enabled)"
+    [ -n "$ONLY_REPO" ] && repos="$ONLY_REPO"
+    if [ -z "$repos" ]; then
+      log "no repos configured — run: goblin repos add owner/name"
+      return 0
+    fi
 
-  for slug in $repos; do
-    engine_repo "$slug" "$provider"
-  done
+    for slug in $repos; do
+      engine_repo "$slug" "$provider"
+    done
+  fi
 
   # After the reviews, never before: a version check is the least important thing
   # this run does and must not delay or risk the work. Throttled to once a day
@@ -81,6 +91,79 @@ cmd_run() {
     --argjson n "$((fin + $(cfg_get '.intervalSeconds' 900)))" \
     '{state:"idle",pausedReason:"",activity:"",lastRunFinished:$f,nextRunEstimate:$n}')"
   log "=== run done ($REVIEWS_THIS_RUN reviewed) ==="
+}
+
+engine_run_lock_release() {
+  if [ "$RUN_LOCK_HELD" = true ]; then lock_release; RUN_LOCK_HELD=false; fi
+}
+
+engine_checkout_dir() {
+  if [ -n "$ONLY_PR" ]; then printf '%s/checkout-%s-%s' "$RUNTMP" "$2" "$$"
+  else goblin_repo_dir "$1"
+  fi
+}
+
+engine_checkout_release() {
+  [ -n "$ACTIVE_CHECKOUT" ] && rm -rf "$ACTIVE_CHECKOUT"
+  ACTIVE_CHECKOUT=""
+}
+
+# --auto is intentionally a local head watcher, not a webhook server. It keeps
+# one simple GitHub API loop alive and delegates each cycle to a fresh process so
+# the existing run lock and cleanup traps retain their one-run lifetime.
+cmd_auto() {
+  local repo="${1:-}" login interval="${GOBLIN_WATCH_INTERVAL:-30}" rc=0
+  if [ -n "$repo" ] && ! printf '%s' "$repo" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+    echo "usage: $GOBLIN_SLUG --auto [OWNER/REPO]" >&2; return 2
+  fi
+  case "$interval" in ''|*[!0-9]*) interval=30 ;; esac
+  [ "$interval" -lt 5 ] 2>/dev/null && interval=5
+
+  cfg_ensure; cfg_backfill_defaults
+  login="$(goblin_login)"
+  [ -n "$login" ] || { echo "$GOBLIN_SLUG: configure a GitHub login first" >&2; return 1; }
+
+  if [ -n "$repo" ]; then
+    echo "$GOBLIN_EMOJI watching @$login's PR heads in $repo (Ctrl-C to stop)"
+  else
+    echo "$GOBLIN_EMOJI watching @$login's PR heads across GitHub (Ctrl-C to stop)"
+  fi
+
+  trap 'exit 0' INT TERM
+  while :; do
+    rc=0
+    if [ -n "$repo" ]; then
+      "$GOBLIN_APP/bin/$GOBLIN_SLUG" run --author "$login" --repo "$repo" || rc=$?
+    else
+      "$GOBLIN_APP/bin/$GOBLIN_SLUG" run --author "$login" || rc=$?
+    fi
+    [ "${GOBLIN_AUTO_ONCE:-false}" = "true" ] && break
+    sleep "$interval"
+  done
+  return "$rc"
+}
+
+# `goblin <PR_URL>` — review exactly the pull request someone pasted.
+#
+# This was one branch of a `--manual` command that also took OWNER/REPO and
+# OWNER/REPO#N, and prompted for a target when given neither. All of it ended in
+# the same `goblin run --repo … --pr … --force` that `goblin run` already spells
+# out, so --manual added a second syntax and an interactive prompt on top of a
+# link people can paste straight from the browser. Repo-wide and exact-PR runs
+# without a link are `goblin run --repo OWNER/NAME [--pr N] --force`.
+cmd_url() {
+  local url="${1:-}" parsed repo pr
+  # GitHub's Files/Commits/Checks tabs put a path segment after the number
+  # (.../pull/23/files, .../pull/23/checks?check_run_id=5) — exactly what the
+  # address bar holds on those tabs, and a normal thing to paste. `/?` only
+  # tolerated a single bare trailing slash, so those pastes were rejected.
+  parsed="$(printf '%s' "$url" | sed -nE \
+    's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(/[^?#]*)?([?#].*)?$|\1/\2 \3|p')"
+  [ -n "$parsed" ] || { echo "not a GitHub pull request URL: $url" >&2; return 2; }
+  repo="${parsed% *}"; pr="${parsed##* }"
+  # --force because pasting a link is a deliberate act: it bypasses the snooze
+  # and the configured repo scope exactly as the old --manual did.
+  cmd_run --repo "$repo" --pr "$pr" --force
 }
 
 # --- gates ----------------------------------------------------------------
@@ -127,7 +210,10 @@ engine_budget_ok() {
   # quota — and hitting a provider's quota is the failure that takes the Goblin
   # down for everyone on the team, not just for the PR that tripped it.
   if [ "${max_day:-0}" -gt 0 ] 2>/dev/null; then
-    done_today="$(today_review_count)"
+    # Add in-flight reservations, not just posted events, so this cheap
+    # pre-filter is not wildly stale — but it is still just a pre-filter, not
+    # the authoritative gate: reservation_try below is the atomic one.
+    done_today="$(( $(today_review_count) + $(reservation_count) ))"
     if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
       log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
       status_set '{"state":"paused","pausedReason":"quota","activity":""}'
@@ -177,6 +263,11 @@ engine_repo() {
              updatedAt:0, requested:[]}]' "$meta" > "$prs" 2>/dev/null
   else
     gh_prs "$slug" "$prs" || { log "$slug: could not list PRs (no access?)"; return 1; }
+    if [ -n "$AUTHOR_SCOPE" ]; then
+      jq --arg a "$(lc "$AUTHOR_SCOPE")" \
+        'map(select(((.author // "") | ascii_downcase) == $a))' "$prs" > "$prs.author" 2>/dev/null \
+        && mv "$prs.author" "$prs"
+    fi
   fi
 
   # Oldest PR first. `gh pr list` returns newest-first, which is exactly the
@@ -196,8 +287,29 @@ engine_repo() {
     entry="$(jq -c --argjson i "$i" '.[$i]' "$prs")"
     i=$((i + 1))
     engine_pr "$slug" "$entry" "$provider" || true
+    # Release whatever this PR reserved (see reservation_try), win or lose —
+    # a sweep must not still be holding PR #1's slot while it starts on #2.
+    reservation_release
   done
   rm -f "$prs" "$prs.sorted" 2>/dev/null
+}
+
+engine_user_scope() {
+  local author="$1" provider="$2" prs="$RUNTMP/user-prs-$$.json"
+  gh_user_prs "$author" "$prs" || { log "could not find open PRs for @$author"; return 1; }
+  jq 'sort_by(.createdAt // 0)' "$prs" > "$prs.sorted" 2>/dev/null \
+    && mv "$prs.sorted" "$prs"
+
+  local n i=0 entry slug
+  n="$(jq 'length' "$prs" 2>/dev/null || echo 0)"
+  log "@$author: $n open PR(s) across GitHub"
+  while [ "$i" -lt "${n:-0}" ]; do
+    entry="$(jq -c --argjson i "$i" '.[$i]' "$prs")"; i=$((i + 1))
+    slug="$(printf '%s' "$entry" | jq -r '.repo')"
+    engine_pr "$slug" "$entry" "$provider" || true
+    reservation_release
+  done
+  rm -f "$prs" 2>/dev/null
 }
 
 # --- failure backoff -------------------------------------------------------
@@ -206,6 +318,18 @@ engine_repo() {
 
 # --- per PR ---------------------------------------------------------------
 engine_pr() {
+  local slug="$1" entry="$2" provider="$3" pr rc
+  pr="$(printf '%s' "$entry" | jq -r '.number')"
+  if ! pr_lock_acquire "$slug" "$pr"; then
+    log "  #$pr: another review of this PR is active, skipping"
+    return 0
+  fi
+  engine_pr_unlocked "$slug" "$entry" "$provider"; rc=$?
+  pr_lock_release
+  return "$rc"
+}
+
+engine_pr_unlocked() {
   local slug="$1" entry="$2" provider="$3"
   local pr head title url base draft
   pr="$(printf '%s' "$entry"    | jq -r '.number')"
@@ -217,8 +341,8 @@ engine_pr() {
 
   [ "$draft" = "true" ] && { log "  #$pr: draft, skipping"; return 0; }
 
-  local key="${pr}:${head}"
-  if [ "$FORCE" != true ] && [ -z "$ONLY_PR" ] && ledger_has "$key"; then return 0; fi
+  local key="${slug}#${pr}:${head}"
+  if [ "$FORCE" != true ] && [ -z "$ONLY_PR" ] && ledger_reviewed "$slug" "$pr" "$head"; then return 0; fi
 
   if [ "$FORCE" != true ] && attempt_blocked "$key"; then
     log "  #$pr: backing off after repeated failures, skipping"
@@ -226,7 +350,8 @@ engine_pr() {
   fi
 
   # --- gate: is this PR mine to review? (free) ---
-  if [ -z "$ONLY_PR" ] && [ "$(cfg_get '.fleetAssignment' true)" = "true" ]; then
+  if [ "$FORCE" != true ] && [ -z "$ONLY_PR" ] && [ -z "$AUTHOR_SCOPE" ] \
+     && [ "$(cfg_get '.fleetAssignment' true)" = "true" ]; then
     local eligible assignee
     eligible="$(claim_eligible "$entry")"
     if [ -z "$eligible" ]; then
@@ -267,7 +392,7 @@ engine_pr() {
   # are posted under a human token and are otherwise indistinguishable, and without
   # that exclusion the Goblin sees itself and never reviews the repo again.
   if [ "$(cfg_get '.skipIfHumanReviewed' true)" = "true" ] && [ "$FORCE" != true ] \
-     && [ -z "$ONLY_PR" ]; then
+     && [ -z "$ONLY_PR" ] && [ -z "$AUTHOR_SCOPE" ]; then
     local rj humans; rj="$RUNTMP/reviews-$pr-$$.json"
     if gh_reviews_fetch "$slug" "$pr" "$rj"; then
       humans="$(gh_human_reviewers "$rj" | paste -sd, - 2>/dev/null)"
@@ -281,7 +406,23 @@ engine_pr() {
     rm -f "$rj" 2>/dev/null
   fi
 
+  # engine_budget_ok is a cheap, non-atomic pre-filter — it can and does race
+  # under concurrent exact-PR audits, so it is not the authoritative gate.
+  # reservation_try is: it recounts posted+reserved and reserves this slot in
+  # ONE locked step, so only as many concurrent audits as maxReviewsPerDay
+  # allows ever get past it, whatever engine_budget_ok itself saw.
   engine_budget_ok || return 1
+  # A dry run (`goblin run --plan`) never posts anything, so it must never
+  # occupy a real quota slot — reserving one here blocked a genuine
+  # concurrent audit with a quota error over a run that was only previewing.
+  if [ "$DRY_RUN" != true ]; then
+    local max_day; max_day="$(cfg_get '.maxReviewsPerDay' 0)"
+    if ! reservation_try "${slug}#${pr}:$$" "$max_day"; then
+      log "  #$pr: hit maxReviewsPerDay ($max_day) — resumes tomorrow"
+      status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+      return 1
+    fi
+  fi
 
   # --- gate: is it still open? (1 call, saves a whole model run) ---
   # The PR list is a snapshot from the top of the run; anything in it may have
@@ -322,7 +463,7 @@ engine_review_pr() {
   log "  #$pr: reviewing ($title)"
   status_set "$(jq -nc --arg a "reviewing #$pr — $title" '{state:"reviewing",activity:$a}')"
   notify started "$GOBLIN_NAME is reviewing" "#$pr — $title"
-  [ "$DRY_RUN" != true ] && gh_status "$slug" "$head" pending "reviewing with $provider"
+  [ "$DRY_RUN" != true ] && gh_status "$slug" "$head" pending "selecting independent reviewers"
 
   # 1. the diff, from GitHub (source of truth for what is commentable)
   if ! diff_fetch_files "$slug" "$pr" "$work/files.json"; then
@@ -332,11 +473,30 @@ engine_review_pr() {
   diff_annotated  "$work/files.json" "$work/diff.txt" "$(cfg_get '.maxDiffBytes' 400000)"
 
   # 2. a checkout, so the model can read surrounding code
-  local repo_dir; repo_dir="$(goblin_repo_dir "$slug")"
-  engine_checkout "$slug" "$pr" "$repo_dir" || log "  #$pr: no local checkout (reviewing from diff only)"
+  local repo_dir isolated_checkout=false
+  repo_dir="$(engine_checkout_dir "$slug" "$pr")"
+  if [ -n "$ONLY_PR" ]; then isolated_checkout=true; ACTIVE_CHECKOUT="$repo_dir"; fi
+  if ! engine_checkout "$slug" "$pr" "$repo_dir"; then
+    log "  #$pr: no local checkout (reviewing from diff only)"
+    [ "$isolated_checkout" = true ] && engine_checkout_release
+    repo_dir="$work"; isolated_checkout=false
+  fi
 
   # 3. context: PR meta, ticket, findings already posted
   gh_pr_meta "$slug" "$pr" "$work/pr.json" || printf '{"number":%s,"title":"%s","body":"","base":"%s","author":""}' "$pr" "$title" "$base" > "$work/pr.json"
+  gh_pr_agent_evidence "$slug" "$pr" "$work/pr.json" "$work/agent-evidence.txt"
+  reviewers_plan "$work/agent-evidence.txt" "$work/review-plan.json"
+  local contributor reviewer_names plan_note
+  # Every detected contributor, not just the highest-scoring one — the whole
+  # point is that none of them is asked to review.
+  contributor="$(jq -r 'if (.contributors // []) | length > 0
+                        then [.contributors[].label] | join(" + ")
+                        else "none detected" end' "$work/review-plan.json")"
+  reviewer_names="$(jq -r '[.reviewers[].label] | join(" + ")' "$work/review-plan.json")"
+  plan_note="$(jq -r '.note // ""' "$work/review-plan.json")"
+  log "  #$pr: coding-agent contributor(s): $contributor"
+  log "  #$pr: independent reviewers (parallel): $reviewer_names"
+  [ -n "$plan_note" ] && log "  #$pr: $plan_note"
   gh_ticket_context "$slug" "$pr" "$work/pr.json" "$work/ticket.txt" >/dev/null
   : > "$work/prior.txt"
   local prior_json="$work/prior.json"; echo '[]' > "$prior_json"
@@ -352,23 +512,27 @@ engine_review_pr() {
 
   if [ "$DRY_RUN" = true ]; then
     engine_dry_run "$work" "$slug" "$pr" "$head" "$base" "$provider"
+    [ "$isolated_checkout" = true ] && engine_checkout_release
     rm -rf "$work"; return 0
   fi
 
-  # 5. run the model
-  if ! findings_run "$provider" "$work/prompt.txt" "${repo_dir:-$work}" "$work/norm.json" "$work/raw"; then
-    local kind="${GOBLIN_P_ERRKIND:-other}"
-    log "  #$pr: review failed ($kind) ${GOBLIN_P_ERRMSG:-}"
+  # 5. run both non-contributor reviewers concurrently, then merge their output.
+  if ! reviewers_run "$work/review-plan.json" "$work/prompt.txt" "${repo_dir:-$work}" "$work" \
+     || ! reviewers_merge "$work/review-plan.json" "$work" "$work/norm.json" "$work/review-plan-final.json"; then
+    local kind="reviewer_failure" errors
+    errors="$(jq -rs '[.[] | select(.ok != true) | (.provider + ": " + (.error // "failed"))] | join("; ")' "$work"/meta-*.json 2>/dev/null)"
+    log "  #$pr: independent review failed ${errors:+($errors)}"
     # Keep the evidence. Without this a failure is unreproducible — you'd have
     # to pay for another review just to see what the model actually said.
     rm -rf "$GOBLIN_HOME/last-failure"
     cp -R "$work" "$GOBLIN_HOME/last-failure" 2>/dev/null \
       && log "  #$pr: raw output kept at $GOBLIN_HOME/last-failure"
-    events_append failed "$pr" "$title" "$url" "${GOBLIN_P_COST_USD:-0}" "$kind" "$slug" "$provider" "${GOBLIN_P_MODEL:-}"
+    events_append failed "$pr" "$title" "$url" 0 "$kind" "$slug" "$provider" "$reviewer_names"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — $kind"
     gh_status "$slug" "$head" error "review failed: $kind"
-    attempt_record "${pr}:${head}" "$kind"
+    attempt_record "${slug}#${pr}:${head}" "$kind"
     status_set '{"state":"idle","activity":""}'
+    [ "$isolated_checkout" = true ] && engine_checkout_release
     rm -rf "$work"; return 1
   fi
 
@@ -381,24 +545,34 @@ engine_review_pr() {
 
   engine_publish "$work" "$slug" "$pr" "$head" "$base" "$title" "$url" "$provider" "$prior_json"
   local rc=$?
+  [ "$isolated_checkout" = true ] && engine_checkout_release
   rm -rf "$work"
   return $rc
 }
 
 engine_publish() {
   local work="$1" slug="$2" pr="$3" head="$4" base="$5" title="$6" url="$7" provider="$8" prior_json="$9"
-  local model="${GOBLIN_P_MODEL:-$provider}" cost="${GOBLIN_P_COST_USD:-0}"
+  local plan="$work/review-plan-final.json" model cost
+  provider="$(jq -r '[.reviewers[].provider] | join("+")' "$plan" 2>/dev/null)"
+  model="$(jq -r '[.reviewers[] | (.provider + "/" + (.model // .provider))] | join(" + ")' "$plan" 2>/dev/null)"
+  cost="$(jq '[.reviewers[].costUsd // 0] | add // 0' "$plan" 2>/dev/null)"
 
   diff_split_findings "$work/norm.json" "$work/addr.json" "$work/split.json"
-  local event; event="$(findings_verdict "$work/norm.json")"
+  local event requested_event author
+  requested_event="$(findings_verdict "$work/norm.json")"
+  author="$(jq -r '.author // ""' "$work/pr.json" 2>/dev/null)"
+  event="$(findings_review_event "$work/norm.json" "$author" "$GOBLIN_LOGIN")"
+  if [ "$event" != "$requested_event" ]; then
+    log "  #$pr: PR is authored by @$author — posting findings as COMMENT, not $requested_event"
+  fi
   render_review_body "$work/norm.json" "$work/split.json" "$pr" "$head" "$base" \
-                     "$provider" "$model" "$GOBLIN_LOGIN" "$work/files.json" "$event" > "$work/body.md"
+                     "$provider" "$model" "$GOBLIN_LOGIN" "$work/files.json" "$event" "$plan" > "$work/body.md"
   if ! post_build_review "$work/split.json" "$work/body.md" "$head" "$event" \
                          "$provider" "$model" "$pr" "$work/review.json"; then
     events_append failed "$pr" "$title" "$url" "$cost" "payload incomplete" "$slug" "$provider" "$model"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — review payload was incomplete"
     gh_status "$slug" "$head" error "review payload was incomplete"
-    attempt_record "${pr}:${head}" "payload"
+    attempt_record "${slug}#${pr}:${head}" "payload"
     return 1
   fi
 
@@ -406,7 +580,7 @@ engine_publish() {
   # long enough on this repo for the PR to merge underneath us.
   if ! gh_pr_is_open "$slug" "$pr"; then
     log "  #$pr: merged or closed during the review — not posting"
-    ledger_add "${pr}:${head}"
+    ledger_add "${slug}#${pr}:${head}"
     status_set '{"state":"idle","activity":""}'
     return 0
   fi
@@ -414,10 +588,13 @@ engine_publish() {
   local review_url
   if ! review_url="$(post_review "$slug" "$pr" "$work/review.json" "$work/err.json")"; then
     log "  #$pr: posting failed — $(head -c 200 "$work/err.json" 2>/dev/null)"
+    rm -rf "$GOBLIN_HOME/last-failure"
+    cp -R "$work" "$GOBLIN_HOME/last-failure" 2>/dev/null \
+      && log "  #$pr: failed payload kept at $GOBLIN_HOME/last-failure"
     events_append failed "$pr" "$title" "$url" "$cost" "post failed" "$slug" "$provider" "$model"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — could not post review"
     gh_status "$slug" "$head" error "could not post review"
-    attempt_record "${pr}:${head}" "post"
+    attempt_record "${slug}#${pr}:${head}" "post"
     return 1
   fi
 
@@ -439,9 +616,15 @@ engine_publish() {
   inline_n="$(jq '.inline | length' "$work/split.json")"
   gh_status "$slug" "$head" success "$counts · $model" "$review_url"
 
-  ledger_add "${pr}:${head}"
-  attempt_clear "${pr}:${head}"
+  ledger_add "${slug}#${pr}:${head}"
+  attempt_clear "${slug}#${pr}:${head}"
   events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"
+  # The moment the posted event exists, today_review_count sees it — holding
+  # the reservation any longer double-counts this same review as both
+  # reserved AND posted, which can refuse a concurrent audit that is actually
+  # still under the real cap. The loop/trap release later is a no-op safety
+  # net for every path that returns before this point, not the primary one.
+  reservation_release
   REVIEWS_THIS_RUN=$((REVIEWS_THIS_RUN + 1))
   log "  #$pr: posted — $counts ($inline_n inline)${cost:+, \$$cost}"
   notify posted "$GOBLIN_NAME posted ✅" "#$pr — $counts"
@@ -451,9 +634,13 @@ engine_publish() {
 
 engine_dry_run() {
   local work="$1" slug="$2" pr="$3" head="$4" base="$5" provider="$6"
+  local contributor reviewers
+  contributor="$(jq -r 'if .contributor.detected then .contributor.label else "none detected" end' "$work/review-plan.json")"
+  reviewers="$(jq -r '[.reviewers[].label] | join(" + ")' "$work/review-plan.json")"
   echo
   echo "── dry run: $slug#$pr @ $(trunc "$head" 7) ────────────────────"
-  echo "provider:          $provider"
+  echo "coding agent:      $contributor"
+  echo "reviewers:         $reviewers (parallel)"
   echo "prompt:            $(wc -c < "$work/prompt.txt" | tr -d ' ') bytes  ($work/prompt.txt)"
   echo "diff:              $(wc -c < "$work/diff.txt" | tr -d ' ') bytes, $(jq 'length' "$work/files.json") files"
   echo "addressable lines: $(jq 'length' "$work/addr.json")"
@@ -476,7 +663,9 @@ engine_dry_run() {
 engine_checkout() {
   local slug="$1" pr="$2" dir="$3"
   if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
-    log "  cloning $slug (one-time)"
+    if [ -n "$ONLY_PR" ]; then log "  cloning isolated checkout for $slug#$pr"
+    else log "  cloning $slug (one-time)"
+    fi
     rm -rf "$dir"
     git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
   fi

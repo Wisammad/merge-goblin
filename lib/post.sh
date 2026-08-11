@@ -88,7 +88,7 @@ post_review() {
   local bad
   bad="$(jq -r '[.errors[]? | .index // empty] | @json' "$errf" 2>/dev/null)"
   if [ -n "$bad" ] && [ "$bad" != "[]" ] && [ "$bad" != "null" ]; then
-    log "  review rejected; demoting $(printf '%s' "$bad" | jq 'length') unmappable comment(s) into the body"
+    log "  review rejected; demoting $(printf '%s' "$bad" | jq 'length') unmappable comment(s) into the body" >&2
     if post_fold_into_body "$payload" "$payload.2" "$bad" && [ -s "$payload.2" ]; then
       if resp="$(gh api -X POST "repos/$slug/pulls/$pr/reviews" --input "$payload.2" 2>"$errf")"; then
         printf '%s' "$resp" | jq -r '.html_url // ""'; return 0
@@ -98,9 +98,9 @@ post_review() {
 
   # Last resort: no inline comments at all — but every finding moves into the
   # body first, so the review still says everything it found.
-  log "  inline comments rejected entirely — demoting all findings into the body"
+  log "  inline comments rejected entirely — demoting all findings into the body" >&2
   if ! post_fold_into_body "$payload" "$payload.3" || [ ! -s "$payload.3" ]; then
-    log "  could not demote findings into the body — refusing to post a review that would lose them"
+    log "  could not demote findings into the body — refusing to post a review that would lose them" >&2
     return 1
   fi
   if resp="$(gh api -X POST "repos/$slug/pulls/$pr/reviews" --input "$payload.3" 2>"$errf")"; then

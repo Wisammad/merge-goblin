@@ -39,16 +39,17 @@ render_counts() {
 # render_inline_body <finding-json> <provider> <model> <pr> <head>
 render_inline_body() {
   local f="$1" provider="$2" model="$3" pr="$4" head="$5"
-  local sev title body sug marker
+  local sev title body sug marker agents
   sev="$(printf '%s'   "$f" | jq -r '.severity')"
   title="$(printf '%s' "$f" | jq -r '.title')"
   body="$(printf '%s'  "$f" | jq -r '.body')"
   sug="$(printf '%s'   "$f" | jq -r '.suggestion // ""')"
 
+  agents="$(printf '%s' "$f" | jq -c '.reviewers // []' 2>/dev/null)"
   marker="$(render_marker finding "$(jq -nc \
     --arg id "$(printf '%s' "$f" | jq -r '.id')" --arg sev "$sev" --arg m "$model" \
-    --argjson pr "$pr" --arg head "$head" \
-    '{v:1,id:$id,pr:$pr,headSha:$head,severity:$sev,model:$m}')")"
+    --argjson pr "$pr" --arg head "$head" --argjson reviewers "${agents:-[]}" \
+    '{v:1,id:$id,pr:$pr,headSha:$head,severity:$sev,model:$m,reviewers:$reviewers}')")"
 
   printf '%s\n%s **%s**\n\n%s\n' "$marker" "$(goblin_severity_label "$sev")" "$title" "$body"
   # A suggestion block only renders as applyable if it replaces exactly the
@@ -56,13 +57,18 @@ render_inline_body() {
   if [ -n "$sug" ] && [ "$sug" != "null" ]; then
     printf '\n```suggestion\n%s\n```\n' "$sug"
   fi
-  printf '\n<sub>%s %s · `%s/%s`</sub>' "$GOBLIN_EMOJI" "$GOBLIN_SHORT" "$provider" "$model"
+  if [ "$(printf '%s' "${agents:-[]}" | jq 'length' 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+    printf '\n<sub>%s %s · independently reported by %s</sub>' "$GOBLIN_EMOJI" "$GOBLIN_SHORT" \
+      "$(printf '%s' "$agents" | jq -r 'map("`" + .provider + "/" + .model + "`") | join(" + ")')"
+  else
+    printf '\n<sub>%s %s · `%s/%s`</sub>' "$GOBLIN_EMOJI" "$GOBLIN_SHORT" "$provider" "$model"
+  fi
 }
 
 # render_review_body <norm.json> <split.json> <pr> <head> <base> <provider> <model> <login> <files.json> <event>
 render_review_body() {
   local norm="$1" split="$2" pr="$3" head="$4" base="$5" provider="$6" model="$7" login="$8" files="$9"
-  local event="${10:-COMMENT}"
+  local event="${10:-COMMENT}" plan="${11:-}"
   local ids counts adds dels blockers total
 
   ids="$(jq -c '[.findings[].id]' "$norm" 2>/dev/null)"
@@ -78,6 +84,49 @@ render_review_body() {
     --argjson counts "${counts:-{\}}" --argjson ids "${ids:-[]}" \
     '{v:1,type:"review",bot:$bot,provider:$p,model:$m,pr:$pr,headSha:$head,by:$by,at:$at,counts:$counts,findingIds:$ids}')"
   printf '\n%s\n\n' "$(goblin_badge "$GOBLIN_TAGLINE")"
+
+  if [ -n "$plan" ] && jq -e '.reviewers | length > 0' "$plan" >/dev/null 2>&1; then
+    local detected contributor signal routed opus_used
+    detected="$(jq -r '.contributor.detected' "$plan")"
+    contributor="$(jq -r '.contributor.label // ""' "$plan")"
+    # "No contributor detected" no longer always means the Claude+Opus
+    # fallback: reviewers_plan also falls through that branch to whatever is
+    # actually installed when Opus's companion is not available, and this
+    # banner used to keep naming Opus regardless — false attribution on a
+    # posted review. modelOverride is only ever "opus" when that branch ran.
+    opus_used="$(jq -r '[.reviewers[]? | select(.modelOverride == "opus")] | length > 0' "$plan")"
+    signal="$(jq -r '.contributor.signal // ""' "$plan" | tr -d '\000-\037' | cut -c 1-180)"
+    routed="$(jq -r '[.reviewers[] | "**" + .label + "** (`" + (.model // .provider) + "`)"] | join(" and ")' "$plan")"
+    local contributors note independent failed
+    # Name every contributor. Printing only the top scorer hid the reason a
+    # reviewer was excluded whenever more than one agent had touched the branch.
+    contributors="$(jq -r '[(.contributors // [])[] | .label + " (" + (.matches|tostring) + ")"] | join(", ")' "$plan")"
+    note="$(jq -r '.note // ""' "$plan" | tr -d '\000-\037')"
+    independent="$(jq -r 'if has("independent") then .independent else true end' "$plan")"
+    failed="$(jq -r '[.reviewers[]? | select(has("ok") and .ok == false)
+                      | .label + " (" + ((.error // "failed") | tostring) + ")"] | join(", ")' "$plan" \
+              | tr -d '\000-\037' | cut -c 1-300)"
+
+    if [ "$detected" = true ]; then
+      printf '> **Coding-agent contributor(s) detected:** **%s**' "${contributors:-$contributor}"
+      [ -n "$signal" ] && printf ' — first signal: `%s`' "$signal"
+      printf '.\n>\n'
+    elif [ "$opus_used" = true ]; then
+      printf '> **Coding-agent contributor:** no recognized signature; using the Claude Opus 5 fallback route.\n>\n'
+    else
+      printf '> **Coding-agent contributor:** no recognized signature.\n>\n'
+    fi
+    if [ "$independent" = false ]; then
+      printf '> ⚠️ **Not an independent review.** %s\n>\n' "$note"
+    elif [ -n "$note" ]; then
+      printf '> **Note:** %s\n>\n' "$note"
+    fi
+    printf '> **Reviewers asked in parallel:** %s.\n' "$routed"
+    # A review that silently lost half its reviewers reads exactly like a clean
+    # one. Say which reviewer dropped out and why, in the review itself.
+    [ -n "$failed" ] && printf '>\n> ⚠️ **Did not report:** %s. The findings below come only from the reviewer(s) that finished.\n' "$failed"
+    printf '\n'
+  fi
 
   # The verdict line first — it tells a reader how bad this is before they read
   # a single finding.
