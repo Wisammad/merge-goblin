@@ -102,10 +102,15 @@ reservation_try() {
   reserved="$(reservation_count)"
   if [ "${max_day:-0}" -le 0 ] 2>/dev/null \
      || [ "$(( ${posted:-0} + ${reserved:-0} ))" -lt "$max_day" ] 2>/dev/null; then
-    jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
-      && mv "$f.tmp" "$f"
-    RESERVATION_ID="$id"
-    ok=true
+    # Only under the cap AND the write itself actually landed — jq/mv can
+    # fail (disk full, permissions), and reporting success while
+    # reservations.json was never actually updated would let the caller
+    # proceed believing it holds a slot no other process can see.
+    if jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
+         && mv "$f.tmp" "$f"; then
+      RESERVATION_ID="$id"
+      ok=true
+    fi
   fi
   [ "$locked" = true ] && goblin_state_unlock reservations
   [ "$ok" = true ]
@@ -128,14 +133,15 @@ reservation_release() {
   return 0
 }
 
-# reservation_count — live reservations. One older than 30 minutes (generous
-# for the longest realistic review) is treated as abandoned by a process that
-# crashed before releasing it, the same stale-lock tolerance lock_acquire
-# already applies to the mkdir locks.
+# reservation_count — live reservations. One older than goblin_max_review_secs
+# is treated as abandoned by a process that crashed before releasing it — a
+# fixed window here would, at a long configured timeoutSecs, expire the
+# reservation for a review that is still legitimately running and let a
+# second audit through, exactly the overrun this mechanism exists to prevent.
 reservation_count() {
   local f="$RESERVATIONS" out cutoff
   [ -s "$f" ] || { printf '0'; return 0; }
-  cutoff=$(( $(now_epoch) - 1800 ))
+  cutoff=$(( $(now_epoch) - $(goblin_max_review_secs) ))
   out="$(jq -r --argjson cutoff "$cutoff" \
     '[to_entries[] | select((.value.at // 0) >= $cutoff)] | length' "$f" 2>/dev/null)"
   if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi

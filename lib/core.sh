@@ -81,11 +81,28 @@ run_with_timeout() {
   return "$rc"
 }
 
-# Single-instance lock. Stale after 3h (a review can legitimately take minutes).
+# goblin_max_review_secs — the longest one review can legitimately still be
+# running: findings_run makes at most one repair retry, so a single reviewer
+# can take up to 2x the configured per-call timeout, plus overhead for
+# checkout/diff/posting. timeoutSecs is user-configurable up to 7200s, so
+# this is not a constant — anything that treats a review as "abandoned"
+# after a fixed window (a stale PR lock, an expired reservation) must derive
+# that window from this, or a review legitimately using a long configured
+# timeout gets mistaken for a crashed one partway through.
+goblin_max_review_secs() {
+  local to=900
+  command -v cfg_get >/dev/null 2>&1 && to="$(cfg_get '.timeoutSecs' 900)"
+  printf '%s' "$(( ${to:-900} * 2 + 600 ))"
+}
+
+# Single-instance lock. stale_after_mins defaults to 3h — generous for a
+# whole scheduled sweep, which is what the global run lock actually guards;
+# callers protecting one review's worth of work (pr_lock_acquire) pass a
+# tighter, duration-derived value instead.
 lock_acquire() {
-  local dir="${1:-$LOCKDIR}"
+  local dir="${1:-$LOCKDIR}" stale_mins="${2:-180}"
   if [ -d "$dir" ]; then
-    if [ -n "$(find "$dir" -maxdepth 0 -mmin +180 2>/dev/null)" ]; then
+    if [ -n "$(find "$dir" -maxdepth 0 -mmin +"$stale_mins" 2>/dev/null)" ]; then
       log "removing stale lock"
       rmdir "$dir" 2>/dev/null || rm -rf "$dir"
     else
@@ -99,10 +116,15 @@ lock_release() { rmdir "${1:-$LOCKDIR}" 2>/dev/null || true; }
 
 # Exact-PR audits can run together, but never twice for the same PR. The global
 # run lock still serializes scheduled and repo-wide scans.
-PR_LOCKDIR=""
+#
+# The shared 3h default assumed the single-attempt review this feature
+# replaced; at the maximum configured timeoutSecs plus a repair retry, one
+# review can legitimately run close to 4 hours, which a fixed 3h staleness
+# window would treat as abandoned and hand to a second, concurrent audit —
+# the exact duplicate-review-and-post this lock exists to prevent.
 pr_lock_acquire() {
   local dir="$PR_LOCKS_DIR/$(goblin_hash "$1#$2")"
-  lock_acquire "$dir" || return 1
+  lock_acquire "$dir" "$(( $(goblin_max_review_secs) / 60 ))" || return 1
   PR_LOCKDIR="$dir"
 }
 pr_lock_release() {

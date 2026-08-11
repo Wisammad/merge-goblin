@@ -148,6 +148,26 @@ test_pr_locks_allow_distinct_audits() (
   teardown
 )
 
+test_pr_lock_staleness_scales_with_configured_timeout() (
+  setup
+  goblin_ensure_dirs
+  cfg_set --argjson t 7200 '.timeoutSecs = $t'
+  local dir="$PR_LOCKS_DIR/$(goblin_hash acme/repo#9)"
+  mkdir -p "$dir"
+  # 200 minutes old: stale under the generic 3h default every OTHER lock in
+  # this codebase uses, but well within the ~4h a single review can
+  # legitimately still be running at this configured timeout (one repair
+  # retry doubles it, plus overhead) — must not be stolen as abandoned.
+  touch -t "$(date -v-200M '+%Y%m%d%H%M')" "$dir"
+  ( PR_LOCKDIR=""; pr_lock_acquire acme/repo 9 ) \
+    && { echo "a still-plausible-in-flight PR lock was stolen as stale"; return 1; }
+  # But one old enough to exceed even that generous window is still reclaimed.
+  touch -t "$(date -v-300M '+%Y%m%d%H%M')" "$dir"
+  ( PR_LOCKDIR=""; pr_lock_acquire acme/repo 9 && pr_lock_release ) \
+    || { echo "a genuinely abandoned PR lock was never reclaimed"; return 1; }
+  teardown
+)
+
 test_state_lock_excludes_concurrent_holders() (
   setup
   goblin_state_lock testlock || return 1
@@ -1443,6 +1463,19 @@ test_stale_reservation_does_not_count_forever() {
   teardown
 }
 
+test_reservation_staleness_scales_with_configured_timeout() {
+  setup
+  goblin_ensure_dirs
+  cfg_set --argjson t 7200 '.timeoutSecs = $t'
+  # 40 minutes old: stale under the old fixed 30-minute window, but well
+  # within the ~4h a single review can legitimately take at this configured
+  # timeout (one repair retry doubles it, plus overhead).
+  jq -n --argjson old "$(( $(now_epoch) - 2400 ))" '{"acme/one#1:111":{at:$old}}' > "$RESERVATIONS"
+  eq "1" "$(reservation_count)" \
+    || { echo "a still-plausible-in-flight reservation was expired too early"; return 1; }
+  teardown
+}
+
 test_reservation_try_check_and_reserve_are_one_step() {
   setup
   # maxReviewsPerDay of 1: the first reservation must succeed and consume the
@@ -1458,6 +1491,38 @@ test_reservation_try_check_and_reserve_are_one_step() {
   reservation_try "acme/two#2:222" 1 \
     || { echo "releasing the first slot did not free it for the second"; return 1; }
   teardown
+}
+
+test_reservation_try_does_not_claim_success_on_write_failure() (
+  setup
+  # Fail only the final rename, the same way a full disk or a permissions
+  # problem would — not by chmod'ing GOBLIN_HOME, which reservation_try's own
+  # first call (goblin_ensure_dirs) unconditionally chmods back to 700.
+  mv() { case "$2" in */reservations.json) return 1 ;; *) command mv "$@" ;; esac; }
+  reservation_try "acme/one#1:111" 0 \
+    && { echo "reported success while the write never landed"; return 1; }
+  eq "0" "$(reservation_count)" \
+    || { echo "a phantom reservation was recorded despite the failed write"; return 1; }
+  teardown
+)
+
+test_dry_run_does_not_reserve_quota() {
+  # `goblin run --plan` never posts anything and must never occupy a real
+  # quota slot — reserving one blocked a genuine concurrent audit with a
+  # quota error over a run that was only previewing.
+  grep -B3 -F 'reservation_try "${slug}#${pr}:$$"' "$ROOT/lib/engine.sh" | grep -q 'DRY_RUN' \
+    || { echo "reservation_try is no longer guarded against dry runs"; return 1; }
+}
+
+test_reservation_released_when_review_posts() {
+  # Holding the reservation until the whole call chain unwinds back to the
+  # repo/user loop double-counts a review that has already posted — as both
+  # reserved AND posted — which can refuse a concurrent audit that is
+  # actually under the real cap. Release the instant events_append records
+  # the real event, not later.
+  grep -A6 -F 'events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"' \
+    "$ROOT/lib/engine.sh" | grep -q '^  reservation_release$' \
+    || { echo "the reservation is no longer released right when the review posts"; return 1; }
 }
 
 test_maxReviewsPerDay_counts_in_flight_reservations() (
@@ -1990,6 +2055,7 @@ t "state: stats from events"             test_stats_from_events
 t "state: dedup ledger"                  test_ledger
 t "state: ledger is repo scoped"         test_ledger_is_repo_scoped
 t "state: distinct PR locks coexist"     test_pr_locks_allow_distinct_audits
+t "state: pr lock staleness scales with timeout" test_pr_lock_staleness_scales_with_configured_timeout
 t "state: state lock excludes holders"   test_state_lock_excludes_concurrent_holders
 t "state: shared state writers are locked" test_shared_state_writers_are_locked
 t "state: writer keeps a lock it never held untouched" test_state_lock_writer_does_not_release_a_lock_it_never_held
@@ -2050,7 +2116,11 @@ t "engine: attempt keys are repo scoped" test_attempt_keys_are_repo_scoped
 t "engine: attempt_blocked reads legacy key" test_attempt_blocked_reads_the_legacy_key_too
 t "engine: exact audits isolate checkout" test_exact_audits_use_isolated_checkouts
 t "state: reservation try/release/count" test_reservation_try_release_and_count
+t "state: reservation write failure is not success" test_reservation_try_does_not_claim_success_on_write_failure
+t "engine: dry run does not reserve quota" test_dry_run_does_not_reserve_quota
+t "engine: reservation released when posted" test_reservation_released_when_review_posts
 t "state: stale reservation expires"     test_stale_reservation_does_not_count_forever
+t "state: reservation staleness scales with timeout" test_reservation_staleness_scales_with_configured_timeout
 t "state: reservation check+reserve is atomic" test_reservation_try_check_and_reserve_are_one_step
 t "engine: maxReviewsPerDay counts reservations" test_maxReviewsPerDay_counts_in_flight_reservations
 t "security: no token reaches the model" test_no_token_reaches_the_model

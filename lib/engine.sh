@@ -412,11 +412,16 @@ engine_pr_unlocked() {
   # ONE locked step, so only as many concurrent audits as maxReviewsPerDay
   # allows ever get past it, whatever engine_budget_ok itself saw.
   engine_budget_ok || return 1
-  local max_day; max_day="$(cfg_get '.maxReviewsPerDay' 0)"
-  if ! reservation_try "${slug}#${pr}:$$" "$max_day"; then
-    log "  #$pr: hit maxReviewsPerDay ($max_day) — resumes tomorrow"
-    status_set '{"state":"paused","pausedReason":"quota","activity":""}'
-    return 1
+  # A dry run (`goblin run --plan`) never posts anything, so it must never
+  # occupy a real quota slot — reserving one here blocked a genuine
+  # concurrent audit with a quota error over a run that was only previewing.
+  if [ "$DRY_RUN" != true ]; then
+    local max_day; max_day="$(cfg_get '.maxReviewsPerDay' 0)"
+    if ! reservation_try "${slug}#${pr}:$$" "$max_day"; then
+      log "  #$pr: hit maxReviewsPerDay ($max_day) — resumes tomorrow"
+      status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+      return 1
+    fi
   fi
 
   # --- gate: is it still open? (1 call, saves a whole model run) ---
@@ -614,6 +619,12 @@ engine_publish() {
   ledger_add "${slug}#${pr}:${head}"
   attempt_clear "${slug}#${pr}:${head}"
   events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"
+  # The moment the posted event exists, today_review_count sees it — holding
+  # the reservation any longer double-counts this same review as both
+  # reserved AND posted, which can refuse a concurrent audit that is actually
+  # still under the real cap. The loop/trap release later is a no-op safety
+  # net for every path that returns before this point, not the primary one.
+  reservation_release
   REVIEWS_THIS_RUN=$((REVIEWS_THIS_RUN + 1))
   log "  #$pr: posted — $counts ($inline_n inline)${cost:+, \$$cost}"
   notify posted "$GOBLIN_NAME posted ✅" "#$pr — $counts"
