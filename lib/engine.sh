@@ -456,11 +456,17 @@ engine_review_pr() {
   gh_pr_meta "$slug" "$pr" "$work/pr.json" || printf '{"number":%s,"title":"%s","body":"","base":"%s","author":""}' "$pr" "$title" "$base" > "$work/pr.json"
   gh_pr_agent_evidence "$slug" "$pr" "$work/pr.json" "$work/agent-evidence.txt"
   reviewers_plan "$work/agent-evidence.txt" "$work/review-plan.json"
-  local contributor reviewer_names
-  contributor="$(jq -r 'if .contributor.detected then .contributor.label else "none detected" end' "$work/review-plan.json")"
+  local contributor reviewer_names plan_note
+  # Every detected contributor, not just the highest-scoring one — the whole
+  # point is that none of them is asked to review.
+  contributor="$(jq -r 'if (.contributors // []) | length > 0
+                        then [.contributors[].label] | join(" + ")
+                        else "none detected" end' "$work/review-plan.json")"
   reviewer_names="$(jq -r '[.reviewers[].label] | join(" + ")' "$work/review-plan.json")"
-  log "  #$pr: coding-agent contributor: $contributor"
+  plan_note="$(jq -r '.note // ""' "$work/review-plan.json")"
+  log "  #$pr: coding-agent contributor(s): $contributor"
   log "  #$pr: independent reviewers (parallel): $reviewer_names"
+  [ -n "$plan_note" ] && log "  #$pr: $plan_note"
   gh_ticket_context "$slug" "$pr" "$work/pr.json" "$work/ticket.txt" >/dev/null
   : > "$work/prior.txt"
   local prior_json="$work/prior.json"; echo '[]' > "$prior_json"

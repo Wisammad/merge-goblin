@@ -86,20 +86,38 @@ render_review_body() {
   printf '\n%s\n\n' "$(goblin_badge "$GOBLIN_TAGLINE")"
 
   if [ -n "$plan" ] && jq -e '.reviewers | length > 0' "$plan" >/dev/null 2>&1; then
-    local detected contributor matches signal routed
+    local detected contributor signal routed
     detected="$(jq -r '.contributor.detected' "$plan")"
     contributor="$(jq -r '.contributor.label // ""' "$plan")"
-    matches="$(jq -r '.contributor.matches // 0' "$plan")"
     signal="$(jq -r '.contributor.signal // ""' "$plan" | tr -d '\000-\037' | cut -c 1-180)"
     routed="$(jq -r '[.reviewers[] | "**" + .label + "** (`" + (.model // .provider) + "`)"] | join(" and ")' "$plan")"
+    local contributors note independent failed
+    # Name every contributor. Printing only the top scorer hid the reason a
+    # reviewer was excluded whenever more than one agent had touched the branch.
+    contributors="$(jq -r '[(.contributors // [])[] | .label + " (" + (.matches|tostring) + ")"] | join(", ")' "$plan")"
+    note="$(jq -r '.note // ""' "$plan" | tr -d '\000-\037')"
+    independent="$(jq -r 'if has("independent") then .independent else true end' "$plan")"
+    failed="$(jq -r '[.reviewers[]? | select(has("ok") and .ok == false)
+                      | .label + " (" + ((.error // "failed") | tostring) + ")"] | join(", ")' "$plan" \
+              | tr -d '\000-\037' | cut -c 1-300)"
+
     if [ "$detected" = true ]; then
-      printf '> **Coding-agent contributor detected:** **%s** from %s signature match(es)' "$contributor" "$matches"
-      [ -n "$signal" ] && printf ': `%s`' "$signal"
+      printf '> **Coding-agent contributor(s) detected:** **%s**' "${contributors:-$contributor}"
+      [ -n "$signal" ] && printf ' — first signal: `%s`' "$signal"
       printf '.\n>\n'
     else
       printf '> **Coding-agent contributor:** no recognized signature; using the Claude Opus 5 fallback route.\n>\n'
     fi
-    printf '> **Independent reviewers asked in parallel:** %s. The findings below merge both reviews.\n\n' "$routed"
+    if [ "$independent" = false ]; then
+      printf '> ⚠️ **Not an independent review.** %s\n>\n' "$note"
+    elif [ -n "$note" ]; then
+      printf '> **Note:** %s\n>\n' "$note"
+    fi
+    printf '> **Reviewers asked in parallel:** %s.\n' "$routed"
+    # A review that silently lost half its reviewers reads exactly like a clean
+    # one. Say which reviewer dropped out and why, in the review itself.
+    [ -n "$failed" ] && printf '>\n> ⚠️ **Did not report:** %s. The findings below come only from the reviewer(s) that finished.\n' "$failed"
+    printf '\n'
   fi
 
   # The verdict line first — it tells a reader how bad this is before they read
