@@ -123,6 +123,16 @@ goblin_hash() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-12; }
 # either writes, and whichever renames last wins with a snapshot that never saw
 # the other's update, silently dropping it (e.g. one PR's failure backoff).
 # Held only around the write itself, never around a whole review.
+#
+# CONTRACT: goblin_state_lock returns 1 after ~10s of contention without ever
+# acquiring the directory. Every caller MUST check that return value and only
+# call goblin_state_unlock when it was true — unlock is an unconditional
+# rmdir, so unlocking after a failed acquire releases the OTHER process's
+# lock while it is still mid-write, letting a third process in behind it. The
+# idiom every call site here uses:
+#   local locked=false; goblin_state_lock NAME && locked=true
+#   ...
+#   [ "$locked" = true ] && goblin_state_unlock NAME
 goblin_state_lock() {
   local dir="$STATE_LOCKS_DIR/$(goblin_hash "$1")" tries=0
   mkdir -p "$STATE_LOCKS_DIR" 2>/dev/null

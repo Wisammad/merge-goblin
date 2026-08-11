@@ -17,6 +17,7 @@ LOG="$GOBLIN_HOME/$GOBLIN_SLUG.log"
 UIURL="$GOBLIN_HOME/ui.url"             # where a running control panel is listening
 UPDATE_STATE="$GOBLIN_HOME/update.json" # last version check; see update.sh
 INBOX="$GOBLIN_HOME/inbox.json"         # waiting-PR counts for the menu bar; see inbox.sh
+RESERVATIONS="$GOBLIN_HOME/reservations.json" # in-flight review slots; see state.sh
 LOCKDIR="$GOBLIN_HOME/.lock"
 PR_LOCKS_DIR="$GOBLIN_HOME/pr-locks"
 STATE_LOCKS_DIR="$GOBLIN_HOME/state-locks"  # brief per-file locks; see goblin_state_lock

@@ -74,6 +74,60 @@ today_review_count() {
   if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
 }
 
+# reservation_add/_release/_count — an in-flight review slot, counted toward
+# maxReviewsPerDay by today_review_count's caller until this review posts (or
+# fails) and a real events.jsonl entry takes over.
+#
+# Exact-PR audits now run concurrently on purpose (see pr_lock_acquire in
+# core.sh), and engine_budget_ok is only checked ONCE per PR, well before the
+# minutes-long review itself. Two audits for different PRs can both read "N
+# remaining today" before either has posted anything and both proceed,
+# letting maxReviewsPerDay be exceeded by however many raced past the check
+# together. A reservation closes that window for the count cap; the dollar
+# cap keeps its pre-existing imprecision (this run's own cost is not known
+# until the model call returns, same as the single-process case always had).
+RESERVATION_ID=""
+reservation_add() {
+  local id="$1" f="$RESERVATIONS" locked=false
+  goblin_ensure_dirs
+  goblin_state_lock reservations && locked=true
+  [ -s "$f" ] || echo '{}' > "$f"
+  jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
+    && mv "$f.tmp" "$f"
+  [ "$locked" = true ] && goblin_state_unlock reservations
+  RESERVATION_ID="$id"
+}
+
+# reservation_release [id] — defaults to whatever this process last reserved.
+# Safe to call even when nothing was ever reserved (budget denied before
+# reservation_add ran) or when it was already released.
+reservation_release() {
+  local id="${1:-$RESERVATION_ID}" f="$RESERVATIONS" locked=false
+  [ -n "$id" ] || return 0
+  [ -s "$f" ] || { [ "$id" = "$RESERVATION_ID" ] && RESERVATION_ID=""; return 0; }
+  goblin_state_lock reservations && locked=true
+  jq --arg id "$id" 'del(.[$id])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  [ "$locked" = true ] && goblin_state_unlock reservations
+  # This bookkeeping check must not become the function's own return value —
+  # releasing an id that is not the currently-tracked one (or releasing twice)
+  # is still a successful no-op, not a failure.
+  [ "$id" = "$RESERVATION_ID" ] && RESERVATION_ID=""
+  return 0
+}
+
+# reservation_count — live reservations. One older than 30 minutes (generous
+# for the longest realistic review) is treated as abandoned by a process that
+# crashed before releasing it, the same stale-lock tolerance lock_acquire
+# already applies to the mkdir locks.
+reservation_count() {
+  local f="$RESERVATIONS" out cutoff
+  [ -s "$f" ] || { printf '0'; return 0; }
+  cutoff=$(( $(now_epoch) - 1800 ))
+  out="$(jq -r --argjson cutoff "$cutoff" \
+    '[to_entries[] | select((.value.at // 0) >= $cutoff)] | length' "$f" 2>/dev/null)"
+  if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
+}
+
 # status_set '<json patch>' — merge patch over current status, refresh stats,
 # write atomically, then refresh the UI state cache.
 status_set() {
@@ -83,8 +137,11 @@ status_set() {
   # file (e.g. "reviewing #N" then "idle"). Read-patch-write through a fixed
   # temp path is not safe under that: two audits can both read the pre-patch
   # snapshot, and whichever mv's last wins with a patch that never saw the
-  # other's — see goblin_state_lock in core.sh.
-  goblin_state_lock status
+  # other's — see goblin_state_lock in core.sh. That lock can time out and
+  # return failure while another process still holds it, so only unlock when
+  # this call actually acquired it — unlocking unconditionally would rmdir the
+  # other process's lock mid-write.
+  local locked=false; goblin_state_lock status && locked=true
   cur="$(cat "$STATUS" 2>/dev/null)"
   if ! printf '%s' "$cur" | jq -e . >/dev/null 2>&1; then
     cur='{"schemaVersion":1,"state":"idle","pausedReason":"","activity":"","lastRunStarted":0,"lastRunFinished":0,"nextRunEstimate":0}'
@@ -93,11 +150,11 @@ status_set() {
   if printf '%s' "$cur" | jq --argjson patch "$patch" --argjson stats "$stats" \
        '. + $patch + $stats | .schemaVersion = 1' > "$STATUS.tmp" 2>/dev/null; then
     mv "$STATUS.tmp" "$STATUS"
-    goblin_state_unlock status
+    [ "$locked" = true ] && goblin_state_unlock status
     ui_state_write
   else
     rm -f "$STATUS.tmp" 2>/dev/null
-    goblin_state_unlock status
+    [ "$locked" = true ] && goblin_state_unlock status
   fi
 }
 

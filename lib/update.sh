@@ -87,8 +87,10 @@ update_check() {
 
   # Exact-PR audits can run concurrently and each calls update_check at the end
   # of its own run; see goblin_state_lock in core.sh for why a fixed temp path
-  # is not safe under that even though this file is low-traffic.
-  goblin_state_lock update
+  # is not safe under that even though this file is low-traffic. The lock can
+  # time out and return failure while another process still holds it, so only
+  # unlock when this call actually acquired it.
+  local locked=false; goblin_state_lock update && locked=true
   jq -nc --arg latest "$latest" --arg current "$GOBLIN_VERSION" \
      --arg url "$GOBLIN_REPO_URL" --argjson avail "$avail" \
      --argjson at "$(now_epoch)" \
@@ -96,7 +98,7 @@ update_check() {
      > "$UPDATE_STATE.tmp" 2>/dev/null \
     && mv "$UPDATE_STATE.tmp" "$UPDATE_STATE" \
     || rm -f "$UPDATE_STATE.tmp" 2>/dev/null
-  goblin_state_unlock update
+  [ "$locked" = true ] && goblin_state_unlock update
   return 0
 }
 

@@ -57,7 +57,11 @@ attempt_blocked() {
 
 attempt_record() {
   local key="$1" kind="${2:-other}" f; f="$(attempt_file)"
-  goblin_state_lock attempts
+  # goblin_state_lock can time out and return failure while another process
+  # still holds the lock (see core.sh); unlocking unconditionally in that case
+  # would rmdir the OTHER process's lock mid-write. Only the call that actually
+  # acquired it may release it.
+  local locked=false; goblin_state_lock attempts && locked=true
   [ -f "$f" ] || echo '{}' > "$f"
   local maxa base cap n delay
   maxa="$(cfg_get '.failure.maxAttempts' 3)"
@@ -77,7 +81,7 @@ attempt_record() {
      --argjson next "$(( $(now_epoch) + delay ))" --arg kind "$kind" \
      '.[$k] = {n:$n, lastAt:$at, nextAt:$next, kind:$kind}' "$f" > "$f.tmp" 2>/dev/null \
      && mv "$f.tmp" "$f"
-  goblin_state_unlock attempts
+  [ "$locked" = true ] && goblin_state_unlock attempts
   [ "$delay" -gt 0 ] && log "  #${key%%:*}: $n consecutive failures — holding this commit for $((delay / 60))m"
   return 0
 }
@@ -86,9 +90,9 @@ attempt_clear() {
   local key="$1" f; f="$(attempt_file)"
   [ -f "$f" ] || return 0
   local legacy="${key#*#}"
-  goblin_state_lock attempts
+  local locked=false; goblin_state_lock attempts && locked=true
   jq --arg k "$key" --arg k2 "$legacy" 'del(.[$k], .[$k2])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
-  goblin_state_unlock attempts
+  [ "$locked" = true ] && goblin_state_unlock attempts
 }
 
 # attempt_reason <key> — one human-readable line for the panel.

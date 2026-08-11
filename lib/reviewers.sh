@@ -29,7 +29,13 @@ reviewers_plan() {
     counts="$(printf '%s' "$counts" | jq -c --arg p "$p" --argjson n "$n" '. + {($p):$n}')"
     if [ "$n" -gt 0 ]; then
       contributors="${contributors:+$contributors }$p"
-      one="$(grep -Ei "$pattern" "$evidence" 2>/dev/null | head -1 | tr -d '\000-\037' | cut -c 1-180)"
+      # This line comes straight from the PR title, body, branch name or a
+      # commit message — all author-controlled. render.sh puts it inside a
+      # single backtick code span; a backtick in the text would close that
+      # span early and let the rest render as live Markdown in a comment that
+      # otherwise reads as a trusted, automated review. Stripped here, once,
+      # rather than at every place this field is later rendered.
+      one="$(grep -Ei "$pattern" "$evidence" 2>/dev/null | head -1 | tr -d '\000-\037`' | cut -c 1-180)"
       sigs="$(printf '%s' "$sigs" | jq -c --arg p "$p" --arg l "$(reviewer_label "$p")" \
         --argjson n "$n" --arg s "$one" '. + [{provider:$p,label:$l,matches:$n,signal:$s}]')"
       # `best` is now only the headline for the posted review; exclusion uses the
@@ -62,15 +68,35 @@ reviewers_plan() {
 
   local n_ind=0; for p in $independent; do n_ind=$((n_ind + 1)); done
 
-  local reviewers overrides='' note='' is_independent=true fallback
+  local reviewers="" overrides='' note='' is_independent=true fallback
+
   if [ -z "$contributors" ]; then
-    # Nothing to exclude. Two reviewers rather than all three: Claude Opus plus
-    # the configured companion.
+    # Nothing to exclude. Prefer Claude Opus plus the configured companion —
+    # but only when BOTH are actually installed and authed. Hardcoding this
+    # pair regardless of `avail` reintroduced the exact failure the
+    # availability filter above exists to prevent: a machine configured for
+    # cursor that is signed out, with codex actually installed, planned
+    # "claude cursor", both probes failed, and codex was never asked.
     fallback="$(cfg_get '.provider' 'codex')"
     [ "$fallback" = claude ] && fallback=codex
-    reviewers="claude $fallback"; overrides='claude=opus'
+    local pref="claude $fallback" pref_n=0 pp
+    for pp in $pref; do case " $avail " in *" $pp "*) pref_n=$((pref_n + 1)) ;; esac; done
+    if [ "$pref_n" -ge 2 ]; then
+      reviewers="$pref"; overrides='claude=opus'
+    fi
+    # Otherwise fall through to the general, availability-aware logic below —
+    # `independent` already is every available provider here, since nothing
+    # was excluded.
+  fi
+
+  if [ -n "$reviewers" ]; then
+    true  # the preferred pair above was fully available; nothing left to decide
   elif [ "$n_ind" -ge 2 ]; then
-    reviewers="$independent"
+    # At most two reviewers ever run in parallel. When a contributor was
+    # excluded, `independent` already has at most two members; when nothing
+    # was (the branch above), it can be all three available providers and
+    # must still be capped here.
+    reviewers="$(printf '%s\n' $independent | head -2 | paste -sd' ' -)"
   elif [ "$n_ind" -eq 1 ]; then
     reviewers="$independent"
     note="only $(reviewer_label "$independent") is both independent and available here, so it reviewed alone"
@@ -86,7 +112,9 @@ reviewers_plan() {
       | (if ($usable | length) > 0 then $usable else . end)
       | sort_by(.value) | .[0].key')"
     is_independent=false
-    if [ "$n_ind_raw" -gt 0 ]; then
+    if [ -z "$contributors" ]; then
+      note="no coding-agent signature was detected, and no provider is installed/authenticated here; reviewing with $(reviewer_label "$reviewers") instead"
+    elif [ "$n_ind_raw" -gt 0 ]; then
       local unavail_labels="" up
       for up in $independent_raw; do unavail_labels="${unavail_labels:+$unavail_labels, }$(reviewer_label "$up")"; done
       note="$unavail_labels did not contribute but is not installed/authenticated on this machine; reviewing with $(reviewer_label "$reviewers") instead — not an independent review"

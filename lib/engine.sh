@@ -46,7 +46,10 @@ cmd_run() {
     if ! lock_acquire; then log "another run is active, exiting"; return 0; fi
     RUN_LOCK_HELD=true
   fi
-  trap 'claim_release; claim_release_comment; engine_checkout_release; pr_lock_release; engine_run_lock_release' EXIT INT TERM
+  # reservation_release here is a crash-safety net, not the primary release —
+  # the per-PR loops in engine_repo/engine_user_scope release explicitly after
+  # every PR so a sweep never holds one PR's slot into the next.
+  trap 'claim_release; claim_release_comment; engine_checkout_release; pr_lock_release; reservation_release; engine_run_lock_release' EXIT INT TERM
 
   log "=== run start ${ONLY_PR:+(pr #$ONLY_PR) }${DRY_RUN:+}$([ "$DRY_RUN" = true ] && echo '(dry run)')"
 
@@ -203,7 +206,11 @@ engine_budget_ok() {
   # quota — and hitting a provider's quota is the failure that takes the Goblin
   # down for everyone on the team, not just for the PR that tripped it.
   if [ "${max_day:-0}" -gt 0 ] 2>/dev/null; then
-    done_today="$(today_review_count)"
+    # Add in-flight reservations, not just posted events: two exact-PR audits
+    # for different PRs can both pass this check before either has posted
+    # anything, and both would otherwise count as "0 used" against each
+    # other. See reservation_add in state.sh.
+    done_today="$(( $(today_review_count) + $(reservation_count) ))"
     if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
       log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
       status_set '{"state":"paused","pausedReason":"quota","activity":""}'
@@ -277,6 +284,9 @@ engine_repo() {
     entry="$(jq -c --argjson i "$i" '.[$i]' "$prs")"
     i=$((i + 1))
     engine_pr "$slug" "$entry" "$provider" || true
+    # Release whatever this PR reserved (see reservation_add), win or lose —
+    # a sweep must not still be holding PR #1's slot while it starts on #2.
+    reservation_release
   done
   rm -f "$prs" "$prs.sorted" 2>/dev/null
 }
@@ -294,6 +304,7 @@ engine_user_scope() {
     entry="$(jq -c --argjson i "$i" '.[$i]' "$prs")"; i=$((i + 1))
     slug="$(printf '%s' "$entry" | jq -r '.repo')"
     engine_pr "$slug" "$entry" "$provider" || true
+    reservation_release
   done
   rm -f "$prs" 2>/dev/null
 }
@@ -393,6 +404,10 @@ engine_pr_unlocked() {
   fi
 
   engine_budget_ok || return 1
+  # Reserve this slot immediately, before the minutes-long review begins —
+  # released by the caller loop once engine_pr returns, whatever the outcome.
+  # See reservation_add in state.sh.
+  reservation_add "${slug}#${pr}:$$"
 
   # --- gate: is it still open? (1 call, saves a whole model run) ---
   # The PR list is a snapshot from the top of the run; anything in it may have

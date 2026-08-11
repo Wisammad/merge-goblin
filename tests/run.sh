@@ -176,7 +176,31 @@ test_shared_state_writers_are_locked() {
     || { echo "status.json writes are no longer lock-protected"; return 1; }
   grep -q 'goblin_state_lock update' "$ROOT/lib/update.sh" \
     || { echo "update.json writes are no longer lock-protected"; return 1; }
+  # goblin_state_lock can time out and return failure while another process
+  # still holds the lock; every writer must guard its unlock on having
+  # actually acquired it, or a timed-out waiter releases the real holder
+  # mid-write. `grep -c` catches both attempt_record and attempt_clear.
+  local n
+  n="$(grep -c 'locked=true' "$ROOT/lib/attempts.sh")"
+  eq "2" "$n" || { echo "attempts.sh: expected both writers to guard their unlock"; return 1; }
+  grep -q 'locked=true' "$ROOT/lib/state.sh" \
+    || { echo "state.sh: status_set does not guard its unlock"; return 1; }
+  grep -q 'locked=true' "$ROOT/lib/update.sh" \
+    || { echo "update.sh: update_check does not guard its unlock"; return 1; }
 }
+
+test_state_lock_writer_does_not_release_a_lock_it_never_held() (
+  setup
+  # Simulate another process already holding the attempts lock, and force
+  # goblin_state_lock to fail the way a real ~10s timeout would. Unlocking
+  # unconditionally here would rmdir the OTHER process's lock mid-write.
+  local dir="$STATE_LOCKS_DIR/$(goblin_hash attempts)"
+  mkdir -p "$STATE_LOCKS_DIR"; mkdir "$dir"
+  goblin_state_lock() { return 1; }
+  attempt_record "acme/one#1:aaa" other
+  [ -d "$dir" ] || { echo "attempt_record released a lock it never acquired"; return 1; }
+  teardown
+)
 
 # -------------------------------------------------------------- findings ---
 test_validate_accepts_minimal() {
@@ -533,6 +557,47 @@ test_all_agents_contributed_is_disclosed() (
   eq "cursor" "$(jq -r '.reviewers[0].provider' "$plan")" || return 1
   jq -e '.note | test("not independent|reviewing its own work")' "$plan" >/dev/null \
     || { echo "a self-review was not disclosed as one"; return 1; }
+  teardown
+)
+
+test_no_signature_plan_still_respects_availability() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # No agent signature at all, so nothing is excluded. The configured default
+  # provider is cursor, but it is signed out here, while codex — not part of
+  # the hardcoded "claude + configured provider" pair — is actually usable.
+  # Hardcoding that pair regardless of `avail` ignored the availability
+  # filter the rest of this planner exists to enforce.
+  cfg_set --arg p cursor '.provider = $p'
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+
+  echo 'ordinary human commit' > "$evidence"
+  reviewers_plan "$evidence" "$plan"
+  eq "false" "$(jq -r '.contributor.detected' "$plan")" || return 1
+  eq "claude codex" "$(jq -r '[.reviewers[].provider] | sort | join(" ")' "$plan")" \
+    || { echo "planned a reviewer that is not installed on this machine"; return 1; }
+  teardown
+)
+
+test_contributor_signal_strips_backticks() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  # The signal is the PR title/body/branch/commit text, which the PR author
+  # controls. render.sh wraps it in one backtick span; an embedded backtick
+  # closes that span early and lets the rest render as live Markdown inside a
+  # comment that otherwise reads as a trusted, automated review.
+  printf 'Co-Authored-By: Claude <noreply@anthropic.com> `**pwned**`\n' > "$evidence"
+  reviewers_plan "$evidence" "$plan"
+  case "$(jq -r '.contributor.signal' "$plan")" in
+    *'`'*) echo "a backtick survived into the rendered signal"; return 1 ;;
+  esac
   teardown
 )
 
@@ -1310,6 +1375,49 @@ test_exact_audits_use_isolated_checkouts() (
   teardown
 )
 
+test_reservation_add_release_and_count() {
+  setup
+  eq "0" "$(reservation_count)" || return 1
+  reservation_add "acme/one#1:111"
+  eq "1" "$(reservation_count)" || return 1
+  reservation_add "acme/two#2:222"
+  eq "2" "$(reservation_count)" || return 1
+  # No-arg release defaults to the most recently added reservation.
+  reservation_release
+  eq "1" "$(reservation_count)" || return 1
+  reservation_release "acme/one#1:111"
+  eq "0" "$(reservation_count)" || return 1
+  # Releasing something never reserved, or already released, is a no-op —
+  # every writer path calls this unconditionally after every PR.
+  reservation_release "acme/one#1:111" || return 1
+  teardown
+}
+
+test_stale_reservation_does_not_count_forever() {
+  setup
+  goblin_ensure_dirs
+  # A reservation this old belongs to a process that crashed before it could
+  # release its own slot — count it the way an abandoned mkdir lock is
+  # already tolerated after its own staleness window.
+  jq -n --argjson old "$(( $(now_epoch) - 3600 ))" '{"acme/one#1:111":{at:$old}}' > "$RESERVATIONS"
+  eq "0" "$(reservation_count)" || { echo "a 1-hour-old reservation still counted"; return 1; }
+  teardown
+}
+
+test_maxReviewsPerDay_counts_in_flight_reservations() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  cfg_set --argjson n 1 '.maxReviewsPerDay = $n'
+  # Nothing posted yet today, but a concurrent exact-PR audit already
+  # reserved the one slot maxReviewsPerDay allows. Without counting it,
+  # two audits racing the same check both see "0 used" and both proceed.
+  reservation_add "acme/one#1:111"
+  engine_budget_ok && { echo "a second audit passed budget while a slot was still reserved"; return 1; }
+  reservation_release "acme/one#1:111"
+  engine_budget_ok || { echo "releasing the reservation did not free the slot back up"; return 1; }
+  teardown
+)
+
 # ---------------------------------------------------------------- update ---
 test_update_version_compare() {
   setup
@@ -1828,6 +1936,7 @@ t "state: ledger is repo scoped"         test_ledger_is_repo_scoped
 t "state: distinct PR locks coexist"     test_pr_locks_allow_distinct_audits
 t "state: state lock excludes holders"   test_state_lock_excludes_concurrent_holders
 t "state: shared state writers are locked" test_shared_state_writers_are_locked
+t "state: writer keeps a lock it never held untouched" test_state_lock_writer_does_not_release_a_lock_it_never_held
 t "findings: validate minimal"           test_validate_accepts_minimal
 t "findings: reject bad severity"        test_validate_rejects_bad_severity
 t "findings: reject empty body"          test_validate_rejects_empty_body
@@ -1849,6 +1958,8 @@ t "reviewers: every contributor excluded"  test_every_contributor_is_excluded
 t "reviewers: self-review is disclosed"    test_all_agents_contributed_is_disclosed
 t "reviewers: independent must be installed" test_independent_reviewer_must_be_installed
 t "reviewers: uses the one available independent reviewer" test_independent_and_available_reviewer_is_used
+t "reviewers: no-signature plan respects availability" test_no_signature_plan_still_respects_availability
+t "reviewers: contributor signal strips backticks" test_contributor_signal_strips_backticks
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
 t "reviewers: zero reviewers still fails"  test_zero_reviewers_is_still_a_failure
 t "fleet: assignment deterministic"      test_assignment_is_deterministic_and_spread
@@ -1881,6 +1992,9 @@ t "engine: manual mode is gone"          test_manual_mode_is_gone
 t "engine: attempt keys are repo scoped" test_attempt_keys_are_repo_scoped
 t "engine: attempt_blocked reads legacy key" test_attempt_blocked_reads_the_legacy_key_too
 t "engine: exact audits isolate checkout" test_exact_audits_use_isolated_checkouts
+t "state: reservation add/release/count" test_reservation_add_release_and_count
+t "state: stale reservation expires"     test_stale_reservation_does_not_count_forever
+t "engine: maxReviewsPerDay counts reservations" test_maxReviewsPerDay_counts_in_flight_reservations
 t "security: no token reaches the model" test_no_token_reaches_the_model
 t "security: caller env restored"        test_callers_environment_is_restored
 t "security: scrub invents nothing"      test_scrub_does_not_invent_unset_vars
