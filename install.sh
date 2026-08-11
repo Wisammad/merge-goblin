@@ -41,6 +41,25 @@ ask() { # ask <prompt> <default>
   local a; printf '%s [%s]: ' "$1" "$2" > /dev/tty; read -r a < /dev/tty || true
   printf '%s' "${a:-$2}"
 }
+# Not every answer is free text, and the ones that aren't have to be caught HERE,
+# while the person who typed them is still looking at the prompt. An email typed
+# at the login prompt used to be stored verbatim and then surface, minutes later
+# and three screens down, as "no stored token for 'you@example.com'" — a message
+# about tokens for what is really a typo. Every other writer (lib/cmd_panel.sh,
+# app/Command.swift) already enforces this shape; the installer was the hole.
+ask_valid() { # ask_valid <regex> <complaint> <prompt> <default>
+  local re="$1" complaint="$2" prompt="$3" def="$4" a
+  while :; do
+    a="$(ask "$prompt" "$def")"
+    # '%s\n', not '%s': an empty answer must still reach grep as one empty LINE.
+    # Printed bare it is zero bytes, grep sees no lines and matches nothing, and a
+    # question that documents "blank to skip" re-asks itself until the tab is closed.
+    printf '%s\n' "$a" | grep -qE "$re" && { printf '%s' "$a"; return 0; }
+    # --non-interactive can't be re-asked, so it fails instead of storing junk.
+    [ "$INTERACTIVE" = false ] && return 1
+    printf '  \033[33m!\033[0m %s\n' "$complaint" > /dev/tty
+  done
+}
 
 printf '\n  %s — %s\n  installing to %s\n\n' "$GOBLIN_NAME" "$GOBLIN_TAGLINE" "$GOBLIN_HOME"
 
@@ -106,13 +125,44 @@ esac
 cfg_ensure; cfg_backfill_defaults
 
 say ""; say "configuration"
+say "  the value in [brackets] is what you get if you just press return."
+
+# Each question says what KIND of answer it wants, because the bracketed default
+# alone doesn't: "github login to review as [Wisammad]" reads as a yes/no to
+# someone seeing it once, and an email typed there used to sail straight through.
+say ""
+say "  · the github account the reviews are posted from."
+say "       your github username — not an email, not a password."
 CUR_LOGIN="$(cfg_get '.identity.githubLogin' '')"
 [ -z "$CUR_LOGIN" ] && CUR_LOGIN="$(gh api user --jq .login 2>/dev/null)"
-LOGIN="$(ask "  github login to review as" "$CUR_LOGIN")"
+if ! LOGIN="$(ask_valid '^[A-Za-z0-9-]{1,39}$' \
+      "a github username is letters, digits and dashes — an email is not one" \
+      "  github username" "$CUR_LOGIN")"; then
+  err "'$CUR_LOGIN' is not a github username — set one and re-run:"
+  say "        $GOBLIN_SLUG config set .identity.githubLogin <username>"
+  exit 1
+fi
 cfg_set --arg l "$LOGIN" '.identity.githubLogin = $l'
 ok "reviewing as @$LOGIN"
 
-PROVIDER="$(ask "  which subscription should review" "$(cfg_get '.provider' "$DEFAULT_PROVIDER")")"
+# `found` is what step 2 detected on this machine. Offering anything else is a
+# trap: it saves fine and then fails doctor with "provider is not installed".
+# The default was simply the first one detected, which explained nothing.
+say ""
+CHOICES="$(printf '%s' "$found" | xargs)"          # "claude codex"
+say "  · the ai subscription that does the reviewing."
+say "       installed on this machine: ${CHOICES// /, }"
+CUR_PROVIDER="$(cfg_get '.provider' "$DEFAULT_PROVIDER")"
+case " $CHOICES " in
+  *" $CUR_PROVIDER "*) ;;
+  *) CUR_PROVIDER="$DEFAULT_PROVIDER" ;;           # never default to one that's gone
+esac
+if ! PROVIDER="$(ask_valid "^($(printf '%s' "$CHOICES" | tr ' ' '|'))\$" \
+      "pick one of: ${CHOICES// /, }" \
+      "  provider (${CHOICES// / or })" "$CUR_PROVIDER")"; then
+  err "'$CUR_PROVIDER' is not installed here — pick one of: ${CHOICES// /, }"
+  exit 1
+fi
 cfg_set --arg p "$PROVIDER" '.provider = $p'
 ok "provider: $PROVIDER"
 
@@ -121,8 +171,24 @@ if [ -z "$(cfg_repos_enabled)" ]; then
   if git rev-parse --git-dir >/dev/null 2>&1; then
     GUESS="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
   fi
-  REPO="$(ask "  repo to watch (owner/name, blank to skip)" "$GUESS")"
-  [ -n "$REPO" ] && { cfg_repo_add "$REPO"; ok "watching $REPO"; }
+  say ""
+  say "  · the repo whose pull requests get reviewed."
+  # "blank to skip" was false whenever a repo was guessed: return takes the
+  # DEFAULT, so blank watched the guess. Skipping needs a word of its own.
+  if [ -n "$GUESS" ]; then
+    say "       owner/name. return accepts $GUESS — type 'none' to watch nothing yet."
+  else
+    say "       owner/name — e.g. $LOGIN/my-app. return skips; add repos later with '$GOBLIN_SLUG ui'."
+  fi
+  if ! REPO="$(ask_valid '^$|^none$|^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$' \
+        "a repo looks like owner/name — one slash, no url ('none' to skip)" \
+        "  repo" "$GUESS")"; then
+    warn "'$GUESS' is not an owner/name repo — skipping it"
+    REPO=""
+  fi
+  [ "$REPO" = "none" ] && REPO=""
+  if [ -n "$REPO" ]; then cfg_repo_add "$REPO"; ok "watching $REPO"
+  else ok "no repo yet — add one with '$GOBLIN_SLUG ui'"; fi
 fi
 
 # --- 5. migrate -----------------------------------------------------------

@@ -25,7 +25,16 @@
 case "${1:-}" in
   auth)
     case "${2:-}" in
-      token)  printf 'gho_faketoken\n'; exit 0 ;;
+      token)
+        # `gh auth token --user X` exits non-zero for an account gh has no
+        # credential for. doctor_identity branches on exactly that, so the fake
+        # has to draw the same line instead of handing out a token for any name.
+        u=""
+        while [ $# -gt 0 ]; do
+          case "$1" in -u|--user) u="${2:-}"; shift 2 ;; *) shift ;; esac
+        done
+        [ -n "$u" ] && [ "$u" != "${GH_FAKE_USER:-me}" ] && exit 1
+        printf 'gho_faketoken\n'; exit 0 ;;
       status) printf 'Logged in to github.com account %s\n' "${GH_FAKE_USER:-me}"; exit 0 ;;
       *) exit 0 ;;
     esac ;;

@@ -617,6 +617,86 @@ end run' | osascript - "Goblin" 'x\" & (do shell script "touch /tmp/goblin-pwned
   teardown
 }
 
+# ---------------------------------------------------------------- identity ---
+# A GitHub login is the one setting nothing downstream can recover from: get it
+# wrong and every run finds zero PRs while every check that matters still passes.
+
+# install.sh can't be sourced — it installs — so lift the helper out and test the
+# real code rather than a restatement of it.
+_lift_ask_valid() {
+  INTERACTIVE=false
+  ask() { printf '%s' "$2"; }
+  eval "$(sed -n '/^ask_valid()/,/^}$/p' "$ROOT/install.sh")"
+}
+
+test_installer_refuses_a_login_that_is_not_one() {
+  local re='^[A-Za-z0-9-]{1,39}$'
+  # The exact value that broke a real install: accepted, stored, and only ever
+  # complained about later as a missing token.
+  if ( _lift_ask_valid; ask_valid "$re" c p 'wisammad@outlook.com' ) >/dev/null 2>&1; then
+    echo "installer accepted an email as a github login"; return 1
+  fi
+  if ( _lift_ask_valid; ask_valid "$re" c p '' ) >/dev/null 2>&1; then
+    echo "installer accepted an empty github login"; return 1
+  fi
+  local got
+  got="$( _lift_ask_valid; ask_valid "$re" c p 'Wisammad' )" || { echo "rejected a valid login"; return 1; }
+  eq "Wisammad" "$got" || return 1
+}
+
+test_every_config_answer_is_validated() {
+  # A bare `ask` for a config value is how an email became an identity. All three
+  # configuration answers go through ask_valid. (The y/n migration prompt is not
+  # one of them — anything but "y" already means no, safely.)
+  # A call site always opens its regex with a quote; the usage comment does not.
+  local calls; calls="$(grep -cE "ask_valid ['\"]" "$ROOT/install.sh")"
+  eq "3" "$calls" || { echo "expected login, provider and repo to be validated"; return 1; }
+  # The provider list is whatever step 2 actually detected — never a hardcoded set,
+  # which is how you get offered a subscription this machine cannot run.
+  grep -q 'CHOICES="$(printf .%s. "$found"' "$ROOT/install.sh" \
+    || { echo "provider choices no longer come from what was detected"; return 1; }
+}
+
+test_installer_login_rule_matches_the_other_writers() {
+  # Three writers, one rule. If they drift, one door stays open.
+  local rule='A-Za-z0-9-]{1,39}'
+  for f in install.sh lib/cmd_panel.sh app/Command.swift; do
+    grep -q "$rule" "$ROOT/$f" || { echo "$f no longer enforces the login shape"; return 1; }
+  done
+}
+
+test_doctor_names_the_account_gh_actually_has() {
+  setup
+  # shellcheck source=/dev/null
+  . "$ROOT/lib/doctor.sh"
+  cfg_set --arg l 'wisammad@outlook.com' '.identity.githubLogin = $l'
+  export GH_FAKE_USER=Wisammad
+  local fh="$GOBLIN_HOME/fakehome"; mkdir -p "$fh/.config/gh"
+  printf 'github.com:\n    user: Wisammad\n' > "$fh/.config/gh/hosts.yml"
+
+  local out
+  out="$( HOME="$fh"; DOC_AS_JSON=true; DOC_JSON="[]"; doctor_identity; printf '%s' "$DOC_JSON" )"
+
+  local fix; fix="$(printf '%s' "$out" | jq -r '.[] | select(.status=="fail") | .fix')"
+  [ -n "$fix" ] || { echo "a login gh has no token for did not fail the checkup"; return 1; }
+  # The fix has to point at the typo, not at re-running an auth that already worked.
+  case "$fix" in
+    *"config set .identity.githubLogin Wisammad"*) ;;
+    *) echo "fix does not offer the account gh has: $fix"; return 1 ;;
+  esac
+  teardown
+}
+
+test_doctor_fixes_are_commands_that_exist() {
+  # doctor's promise is "the exact command that fixes it"; a fix gh rejects with
+  # "unknown flag" is worse than none. Only token/switch/logout take --user.
+  local bad
+  bad="$(grep -rnE 'gh auth (login|refresh|status)[^"]*--user' \
+         "$ROOT/lib" "$ROOT/bin" "$ROOT/install.sh" "$ROOT/app" 2>/dev/null \
+       | grep -vE '^[^:]*:[0-9]+:[[:space:]]*(#|//)')"
+  [ -z "$bad" ] || { echo "these gh subcommands do not accept --user:"; echo "$bad"; return 1; }
+}
+
 test_no_hardcoded_personal_paths() {
   # The whole point of the rewrite: nothing tied to one machine, person or repo.
   # Comments are exempt (they explain history), as is the single distribution
@@ -1290,6 +1370,11 @@ t "panel: settings are validated"        test_panel_settings_are_validated
 t "panel: csp forbids inline"            test_panel_csp_forbids_inline
 t "panel: no html injection sinks"       test_panel_has_no_html_injection_sinks
 t "app: build stages before swapping"    test_app_build_stages_before_swapping
+t "identity: installer refuses non-login" test_installer_refuses_a_login_that_is_not_one
+t "identity: every answer is validated"  test_every_config_answer_is_validated
+t "identity: one login rule, 3 writers"  test_installer_login_rule_matches_the_other_writers
+t "identity: doctor names gh's account"  test_doctor_names_the_account_gh_actually_has
+t "identity: doctor fixes really exist"  test_doctor_fixes_are_commands_that_exist
 t "hygiene: no personal paths"           test_no_hardcoded_personal_paths
 
 printf '\n  %s passed, %s failed\n' "$PASS" "$FAIL"
