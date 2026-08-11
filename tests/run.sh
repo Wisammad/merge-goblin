@@ -176,15 +176,17 @@ test_shared_state_writers_are_locked() {
     || { echo "status.json writes are no longer lock-protected"; return 1; }
   grep -q 'goblin_state_lock update' "$ROOT/lib/update.sh" \
     || { echo "update.json writes are no longer lock-protected"; return 1; }
+  grep -q 'goblin_state_lock reservations' "$ROOT/lib/state.sh" \
+    || { echo "reservations.json writes are no longer lock-protected"; return 1; }
   # goblin_state_lock can time out and return failure while another process
   # still holds the lock; every writer must guard its unlock on having
   # actually acquired it, or a timed-out waiter releases the real holder
-  # mid-write. `grep -c` catches both attempt_record and attempt_clear.
+  # mid-write. `grep -c` catches both writers per file.
   local n
   n="$(grep -c 'locked=true' "$ROOT/lib/attempts.sh")"
   eq "2" "$n" || { echo "attempts.sh: expected both writers to guard their unlock"; return 1; }
-  grep -q 'locked=true' "$ROOT/lib/state.sh" \
-    || { echo "state.sh: status_set does not guard its unlock"; return 1; }
+  n="$(grep -c 'locked=true' "$ROOT/lib/state.sh")"
+  eq "3" "$n" || { echo "state.sh: expected status_set, reservation_try and reservation_release to guard their unlock"; return 1; }
   grep -q 'locked=true' "$ROOT/lib/update.sh" \
     || { echo "update.sh: update_check does not guard its unlock"; return 1; }
 }
@@ -892,6 +894,36 @@ JSON
   teardown
 }
 
+test_render_does_not_claim_opus_when_not_used() {
+  setup
+  . "$ROOT/lib/render.sh"
+  echo '{"summary":"s","findings":[]}' > "$GOBLIN_HOME/norm.json"
+  echo '{"inline":[],"demoted":[]}' > "$GOBLIN_HOME/split.json"
+  echo '[{"additions":1,"deletions":0}]' > "$GOBLIN_HOME/files.json"
+  # No contributor detected, and the plan fell through to whatever was
+  # actually installed (codex+cursor) rather than the Claude+Opus pair —
+  # "no contributor" must not always mean "used Opus".
+  cat > "$GOBLIN_HOME/plan.json" <<'JSON'
+{"contributor":{"detected":false,"provider":"","label":"","matches":0,"signal":""},"contributors":[],"independent":true,"note":"","reviewers":[{"provider":"codex","label":"OpenAI Codex","modelOverride":"","model":"codex","ok":true},{"provider":"cursor","label":"Cursor","modelOverride":"","model":"cursor","ok":true}]}
+JSON
+  local body
+  body="$(render_review_body "$GOBLIN_HOME/norm.json" "$GOBLIN_HOME/split.json" 7 abc main \
+    'codex+cursor' 'codex/codex + cursor/cursor' me "$GOBLIN_HOME/files.json" COMMENT "$GOBLIN_HOME/plan.json")"
+  printf '%s' "$body" | grep -qi 'opus' \
+    && { echo "claimed the Opus fallback route when it was not used"; return 1; }
+  printf '%s' "$body" | grep -qF 'no recognized signature' || return 1
+
+  # When the plan DID take the Claude+Opus branch, the banner must still say so.
+  jq '.reviewers = [{provider:"claude",label:"Claude Opus 5",modelOverride:"opus",model:"claude",ok:true},
+                    {provider:"codex",label:"OpenAI Codex",modelOverride:"",model:"codex",ok:true}]' \
+    "$GOBLIN_HOME/plan.json" > "$GOBLIN_HOME/plan2.json"
+  body="$(render_review_body "$GOBLIN_HOME/norm.json" "$GOBLIN_HOME/split.json" 7 abc main \
+    'claude+codex' 'claude/opus + codex/codex' me "$GOBLIN_HOME/files.json" COMMENT "$GOBLIN_HOME/plan2.json")"
+  printf '%s' "$body" | grep -qi 'opus' \
+    || { echo "dropped the Opus fallback mention when it WAS used"; return 1; }
+  teardown
+}
+
 test_no_nul_bytes_in_sources() {
   # A NUL byte inside a shell script ends the lexer's input: bash reports
   # "unexpected EOF" pointing at a line that looks perfectly fine, every function
@@ -1317,8 +1349,15 @@ test_url_target_routing() (
   # Browsers hand out links with tracking params and a #files anchor; a link you
   # can paste is only easier than typing OWNER/REPO#N if it survives being pasted.
   cmd_url 'https://github.com/acme/five/pull/23/?utm_source=test#files' || return 1
+  # The Files/Commits/Checks tabs put an actual PATH segment after the number
+  # (.../pull/23/files, not just a query or hash) — that is what the address
+  # bar holds on those tabs, and a normal thing to paste.
+  cmd_url 'https://github.com/acme/six/pull/7/files' || return 1
+  cmd_url 'https://github.com/acme/six/pull/7/checks?check_run_id=5' || return 1
   eq "--repo acme/four --pr 19 --force
---repo acme/five --pr 23 --force" "$(cat "$calls")" || return 1
+--repo acme/five --pr 23 --force
+--repo acme/six --pr 7 --force
+--repo acme/six --pr 7 --force" "$(cat "$calls")" || return 1
   # Anything that is not a PR link is refused rather than half-parsed.
   cmd_url 'https://github.com/acme/four/issues/19' >/dev/null 2>&1 && return 1
   cmd_url 'acme/four#19'  >/dev/null 2>&1 && return 1
@@ -1375,14 +1414,14 @@ test_exact_audits_use_isolated_checkouts() (
   teardown
 )
 
-test_reservation_add_release_and_count() {
+test_reservation_try_release_and_count() {
   setup
   eq "0" "$(reservation_count)" || return 1
-  reservation_add "acme/one#1:111"
+  reservation_try "acme/one#1:111" 0 || return 1   # 0 == unlimited
   eq "1" "$(reservation_count)" || return 1
-  reservation_add "acme/two#2:222"
+  reservation_try "acme/two#2:222" 0 || return 1
   eq "2" "$(reservation_count)" || return 1
-  # No-arg release defaults to the most recently added reservation.
+  # No-arg release defaults to the most recently reserved id.
   reservation_release
   eq "1" "$(reservation_count)" || return 1
   reservation_release "acme/one#1:111"
@@ -1404,6 +1443,23 @@ test_stale_reservation_does_not_count_forever() {
   teardown
 }
 
+test_reservation_try_check_and_reserve_are_one_step() {
+  setup
+  # maxReviewsPerDay of 1: the first reservation must succeed and consume the
+  # only slot; a second MUST be refused by the same call that would recount
+  # and reserve it — not by a separate, later, separately-locked check. That
+  # separation was the exact race the previous round of this fix still had:
+  # two processes could both recompute "0 used" before either had reserved.
+  reservation_try "acme/one#1:111" 1 || { echo "the first reservation under the cap was refused"; return 1; }
+  reservation_try "acme/two#2:222" 1 && { echo "a second reservation was allowed past a cap of 1"; return 1; }
+  eq "1" "$(reservation_count)" \
+    || { echo "the refused attempt still recorded a reservation"; return 1; }
+  reservation_release "acme/one#1:111"
+  reservation_try "acme/two#2:222" 1 \
+    || { echo "releasing the first slot did not free it for the second"; return 1; }
+  teardown
+}
+
 test_maxReviewsPerDay_counts_in_flight_reservations() (
   setup
   . "$ROOT/lib/engine.sh"
@@ -1411,7 +1467,7 @@ test_maxReviewsPerDay_counts_in_flight_reservations() (
   # Nothing posted yet today, but a concurrent exact-PR audit already
   # reserved the one slot maxReviewsPerDay allows. Without counting it,
   # two audits racing the same check both see "0 used" and both proceed.
-  reservation_add "acme/one#1:111"
+  reservation_try "acme/one#1:111" 0
   engine_budget_ok && { echo "a second audit passed budget while a slot was still reserved"; return 1; }
   reservation_release "acme/one#1:111"
   engine_budget_ok || { echo "releasing the reservation did not free the slot back up"; return 1; }
@@ -1979,6 +2035,7 @@ t "goblin: legacy markers matched"       test_legacy_markers_still_recognised
 t "render: counts never empty"           test_render_counts_is_never_empty
 t "render: review marked automated"      test_render_marks_review_as_automated
 t "render: names contributor + reviewers" test_render_names_contributor_and_both_reviewers
+t "render: no false Opus claim"          test_render_does_not_claim_opus_when_not_used
 t "hygiene: no NUL bytes in sources"     test_no_nul_bytes_in_sources
 t "post: findings survive full demotion" test_post_fold_preserves_findings
 t "post: partial demotion keeps rest"    test_post_fold_partial_keeps_the_rest_inline
@@ -1992,8 +2049,9 @@ t "engine: manual mode is gone"          test_manual_mode_is_gone
 t "engine: attempt keys are repo scoped" test_attempt_keys_are_repo_scoped
 t "engine: attempt_blocked reads legacy key" test_attempt_blocked_reads_the_legacy_key_too
 t "engine: exact audits isolate checkout" test_exact_audits_use_isolated_checkouts
-t "state: reservation add/release/count" test_reservation_add_release_and_count
+t "state: reservation try/release/count" test_reservation_try_release_and_count
 t "state: stale reservation expires"     test_stale_reservation_does_not_count_forever
+t "state: reservation check+reserve is atomic" test_reservation_try_check_and_reserve_are_one_step
 t "engine: maxReviewsPerDay counts reservations" test_maxReviewsPerDay_counts_in_flight_reservations
 t "security: no token reaches the model" test_no_token_reaches_the_model
 t "security: caller env restored"        test_callers_environment_is_restored

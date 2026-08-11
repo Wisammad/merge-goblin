@@ -153,8 +153,12 @@ cmd_auto() {
 # without a link are `goblin run --repo OWNER/NAME [--pr N] --force`.
 cmd_url() {
   local url="${1:-}" parsed repo pr
+  # GitHub's Files/Commits/Checks tabs put a path segment after the number
+  # (.../pull/23/files, .../pull/23/checks?check_run_id=5) — exactly what the
+  # address bar holds on those tabs, and a normal thing to paste. `/?` only
+  # tolerated a single bare trailing slash, so those pastes were rejected.
   parsed="$(printf '%s' "$url" | sed -nE \
-    's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([1-9][0-9]*)/?([?#].*)?$|\1/\2 \3|p')"
+    's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(/[^?#]*)?([?#].*)?$|\1/\2 \3|p')"
   [ -n "$parsed" ] || { echo "not a GitHub pull request URL: $url" >&2; return 2; }
   repo="${parsed% *}"; pr="${parsed##* }"
   # --force because pasting a link is a deliberate act: it bypasses the snooze
@@ -206,10 +210,9 @@ engine_budget_ok() {
   # quota — and hitting a provider's quota is the failure that takes the Goblin
   # down for everyone on the team, not just for the PR that tripped it.
   if [ "${max_day:-0}" -gt 0 ] 2>/dev/null; then
-    # Add in-flight reservations, not just posted events: two exact-PR audits
-    # for different PRs can both pass this check before either has posted
-    # anything, and both would otherwise count as "0 used" against each
-    # other. See reservation_add in state.sh.
+    # Add in-flight reservations, not just posted events, so this cheap
+    # pre-filter is not wildly stale — but it is still just a pre-filter, not
+    # the authoritative gate: reservation_try below is the atomic one.
     done_today="$(( $(today_review_count) + $(reservation_count) ))"
     if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
       log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
@@ -284,7 +287,7 @@ engine_repo() {
     entry="$(jq -c --argjson i "$i" '.[$i]' "$prs")"
     i=$((i + 1))
     engine_pr "$slug" "$entry" "$provider" || true
-    # Release whatever this PR reserved (see reservation_add), win or lose —
+    # Release whatever this PR reserved (see reservation_try), win or lose —
     # a sweep must not still be holding PR #1's slot while it starts on #2.
     reservation_release
   done
@@ -403,11 +406,18 @@ engine_pr_unlocked() {
     rm -f "$rj" 2>/dev/null
   fi
 
+  # engine_budget_ok is a cheap, non-atomic pre-filter — it can and does race
+  # under concurrent exact-PR audits, so it is not the authoritative gate.
+  # reservation_try is: it recounts posted+reserved and reserves this slot in
+  # ONE locked step, so only as many concurrent audits as maxReviewsPerDay
+  # allows ever get past it, whatever engine_budget_ok itself saw.
   engine_budget_ok || return 1
-  # Reserve this slot immediately, before the minutes-long review begins —
-  # released by the caller loop once engine_pr returns, whatever the outcome.
-  # See reservation_add in state.sh.
-  reservation_add "${slug}#${pr}:$$"
+  local max_day; max_day="$(cfg_get '.maxReviewsPerDay' 0)"
+  if ! reservation_try "${slug}#${pr}:$$" "$max_day"; then
+    log "  #$pr: hit maxReviewsPerDay ($max_day) — resumes tomorrow"
+    status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+    return 1
+  fi
 
   # --- gate: is it still open? (1 call, saves a whole model run) ---
   # The PR list is a snapshot from the top of the run; anything in it may have

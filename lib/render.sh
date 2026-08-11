@@ -86,9 +86,15 @@ render_review_body() {
   printf '\n%s\n\n' "$(goblin_badge "$GOBLIN_TAGLINE")"
 
   if [ -n "$plan" ] && jq -e '.reviewers | length > 0' "$plan" >/dev/null 2>&1; then
-    local detected contributor signal routed
+    local detected contributor signal routed opus_used
     detected="$(jq -r '.contributor.detected' "$plan")"
     contributor="$(jq -r '.contributor.label // ""' "$plan")"
+    # "No contributor detected" no longer always means the Claude+Opus
+    # fallback: reviewers_plan also falls through that branch to whatever is
+    # actually installed when Opus's companion is not available, and this
+    # banner used to keep naming Opus regardless — false attribution on a
+    # posted review. modelOverride is only ever "opus" when that branch ran.
+    opus_used="$(jq -r '[.reviewers[]? | select(.modelOverride == "opus")] | length > 0' "$plan")"
     signal="$(jq -r '.contributor.signal // ""' "$plan" | tr -d '\000-\037' | cut -c 1-180)"
     routed="$(jq -r '[.reviewers[] | "**" + .label + "** (`" + (.model // .provider) + "`)"] | join(" and ")' "$plan")"
     local contributors note independent failed
@@ -105,8 +111,10 @@ render_review_body() {
       printf '> **Coding-agent contributor(s) detected:** **%s**' "${contributors:-$contributor}"
       [ -n "$signal" ] && printf ' — first signal: `%s`' "$signal"
       printf '.\n>\n'
-    else
+    elif [ "$opus_used" = true ]; then
       printf '> **Coding-agent contributor:** no recognized signature; using the Claude Opus 5 fallback route.\n>\n'
+    else
+      printf '> **Coding-agent contributor:** no recognized signature.\n>\n'
     fi
     if [ "$independent" = false ]; then
       printf '> ⚠️ **Not an independent review.** %s\n>\n' "$note"

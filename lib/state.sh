@@ -74,33 +74,46 @@ today_review_count() {
   if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
 }
 
-# reservation_add/_release/_count — an in-flight review slot, counted toward
-# maxReviewsPerDay by today_review_count's caller until this review posts (or
-# fails) and a real events.jsonl entry takes over.
+# reservation_try/_release/_count — an in-flight review slot, counted toward
+# maxReviewsPerDay until this review posts (or fails) and a real
+# events.jsonl entry takes over.
 #
 # Exact-PR audits now run concurrently on purpose (see pr_lock_acquire in
-# core.sh), and engine_budget_ok is only checked ONCE per PR, well before the
-# minutes-long review itself. Two audits for different PRs can both read "N
-# remaining today" before either has posted anything and both proceed,
-# letting maxReviewsPerDay be exceeded by however many raced past the check
-# together. A reservation closes that window for the count cap; the dollar
-# cap keeps its pre-existing imprecision (this run's own cost is not known
-# until the model call returns, same as the single-process case always had).
+# core.sh). checking the cap and reserving a slot as two SEPARATELY locked
+# steps (an earlier version of this fix) left the exact race it was meant to
+# close: two processes could both recompute "0 remaining" before either had
+# reserved anything, both pass, and only then both reserve — exceeding the
+# cap by however many raced past the check together. reservation_try folds
+# the recount and the reserve into one locked critical section, so only as
+# many processes as the cap allows ever see success. The dollar cap keeps
+# its pre-existing imprecision (this run's own cost is not known until the
+# model call returns, same as the single-process case always had).
 RESERVATION_ID=""
-reservation_add() {
-  local id="$1" f="$RESERVATIONS" locked=false
+
+# reservation_try <id> <max_day> — <=0 means unlimited. Returns success and
+# records the reservation when under the cap; returns failure, having
+# recorded nothing, when at or over it.
+reservation_try() {
+  local id="$1" max_day="${2:-0}" f="$RESERVATIONS" locked=false posted reserved ok=false
   goblin_ensure_dirs
   goblin_state_lock reservations && locked=true
   [ -s "$f" ] || echo '{}' > "$f"
-  jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
-    && mv "$f.tmp" "$f"
+  posted="$(today_review_count)"
+  reserved="$(reservation_count)"
+  if [ "${max_day:-0}" -le 0 ] 2>/dev/null \
+     || [ "$(( ${posted:-0} + ${reserved:-0} ))" -lt "$max_day" ] 2>/dev/null; then
+    jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
+      && mv "$f.tmp" "$f"
+    RESERVATION_ID="$id"
+    ok=true
+  fi
   [ "$locked" = true ] && goblin_state_unlock reservations
-  RESERVATION_ID="$id"
+  [ "$ok" = true ]
 }
 
 # reservation_release [id] — defaults to whatever this process last reserved.
 # Safe to call even when nothing was ever reserved (budget denied before
-# reservation_add ran) or when it was already released.
+# reservation_try ran) or when it was already released.
 reservation_release() {
   local id="${1:-$RESERVATION_ID}" f="$RESERVATIONS" locked=false
   [ -n "$id" ] || return 0
