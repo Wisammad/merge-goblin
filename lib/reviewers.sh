@@ -40,6 +40,26 @@ reviewers_plan() {
     fi
   done
 
+  # Not a contributor is necessary but not sufficient: the plan must also only
+  # pick reviewers actually installed and authenticated here. Planning by
+  # signature alone routed a Claude-only machine straight at "codex cursor" for
+  # a Claude-authored PR — both probes were guaranteed to fail, reviewers_run
+  # returned total failure, and nothing was ever posted even though Claude
+  # itself was sitting there ready to review (with disclosure), same as the
+  # "every agent contributed" fallback below already does.
+  local n_ind_raw=0; for p in $independent; do n_ind_raw=$((n_ind_raw + 1)); done
+  local avail="" probe
+  for p in claude codex cursor; do
+    command -v "provider_${p}_probe" >/dev/null 2>&1 || continue
+    probe="$("provider_${p}_probe" 2>/dev/null)"
+    [ "$(printf '%s' "$probe" | jq -r '.available and .authed' 2>/dev/null)" = true ] \
+      && avail="${avail:+$avail }$p"
+  done
+  local independent_raw="$independent"; independent=""
+  for p in $independent_raw; do
+    case " $avail " in *" $p "*) independent="${independent:+$independent }$p" ;; esac
+  done
+
   local n_ind=0; for p in $independent; do n_ind=$((n_ind + 1)); done
 
   local reviewers overrides='' note='' is_independent=true fallback
@@ -53,14 +73,26 @@ reviewers_plan() {
     reviewers="$independent"
   elif [ "$n_ind" -eq 1 ]; then
     reviewers="$independent"
-    note="only $(reviewer_label "$independent") did not contribute here, so it reviewed alone"
+    note="only $(reviewer_label "$independent") is both independent and available here, so it reviewed alone"
   else
-    # Every agent we can run contributed. There is no independent reviewer to be
-    # had, so review with the least-involved one and say so in the posted review
-    # rather than quietly presenting a self-review as an independent one.
-    reviewers="$(printf '%s' "$counts" | jq -r 'to_entries | sort_by(.value) | .[0].key')"
+    # No candidate is both uninvolved and actually usable — either every agent
+    # contributed, or the ones that didn't are not installed/authed here.
+    # Prefer the least-involved CONTRIBUTOR that IS available; fall back to
+    # least-involved overall only if nothing on this machine is usable at all.
+    reviewers="$(printf '%s' "$counts" | jq -r --arg avail "$avail" '
+      ($avail | split(" ") | map(select(length > 0))) as $av
+      | to_entries
+      | (map(select(.key as $k | $av | index($k)))) as $usable
+      | (if ($usable | length) > 0 then $usable else . end)
+      | sort_by(.value) | .[0].key')"
     is_independent=false
-    note="every available agent contributed to this PR; $(reviewer_label "$reviewers") had the fewest signatures and is reviewing its own work"
+    if [ "$n_ind_raw" -gt 0 ]; then
+      local unavail_labels="" up
+      for up in $independent_raw; do unavail_labels="${unavail_labels:+$unavail_labels, }$(reviewer_label "$up")"; done
+      note="$unavail_labels did not contribute but is not installed/authenticated on this machine; reviewing with $(reviewer_label "$reviewers") instead — not an independent review"
+    else
+      note="every available agent contributed to this PR; $(reviewer_label "$reviewers") had the fewest signatures and is reviewing its own work"
+    fi
   fi
 
   local list='[]' override label
@@ -218,13 +250,26 @@ reviewers_merge() {
     # line is a single comment with two labelled paragraphs, which still beats
     # two comments. Findings with no line keep the old title-based key so that
     # file-level remarks do not all collapse into one.
-    def mergekey:
+    def posn:
       [ (.path // "repo"),
         (.side // "RIGHT"),
         (if (.line // 0) > 0 then (.line | tostring)
-         else "t/" + (.title | ascii_downcase) end) ] | join(":");
-    .findings = (
-      .findings | group_by(mergekey) | map(
+         else "t/" + (.title | ascii_downcase) end) ];
+    # Position alone is not a safe merge key: it also collapsed two DISTINCT
+    # findings from the SAME reviewer at the same line into one, keeping only
+    # the title, severity and suggestion of the FIRST while burying the body
+    # of the second underneath it — the opposite of a lossless merge. _slot
+    # ranks each finding among the findings that same reviewer raised at that
+    # position, so two different reviewers still merge at one line (both at
+    # slot 0), while two distinct findings from one reviewer at that same
+    # line stay two findings (slot 0 and slot 1) instead of one.
+    ( [ .findings
+        | group_by([.reviewer] + posn)
+        | .[]
+        | to_entries[] | .value + {_slot: .key} ]
+    ) as $slotted
+    | .findings = (
+      $slotted | group_by(posn + [._slot]) | map(
         sort_by(.severity | rank) as $g
         | ($g | map(.reviewer) | unique) as $who
         | $g[0] + {
@@ -234,7 +279,7 @@ reviewers_merge() {
             body: (if ($who | length) <= 1 then ($g | map(.body) | join("\n\n"))
                    else ($g | map("**" + (.reviewer|ascii_upcase) + ":** " + .body) | join("\n\n")) end)
           }
-        | del(.reviewer,.reviewerModel)
+        | del(.reviewer,.reviewerModel,._slot)
       ) | sort_by(.severity | rank) | .[0:$max]
     )
     | .intent_note = (

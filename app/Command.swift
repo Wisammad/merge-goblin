@@ -167,7 +167,7 @@ enum Command: Equatable {
     case repoEnable(slug: String, on: Bool)
 
     // identity
-    case setIdentity(login: String)    // ^[A-Za-z0-9-]{1,39}$
+    case setIdentity(login: String)    // alnum, (-?[A-Za-z0-9]){0,38}: no leading/trailing hyphen
     case fixAccount
 
     // diagnostics / plumbing
@@ -563,7 +563,7 @@ enum Coerce {
 
 enum Pattern {
     case repoSlug       // ^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$
-    case githubLogin    // ^[A-Za-z0-9-]{1,39}$
+    case githubLogin    // alnum, (-?[A-Za-z0-9]){0,38}: no leading/trailing hyphen
     case model          // ^[A-Za-z0-9._:-]{0,64}$
     case searchQuery    // ^[A-Za-z0-9 ._/-]{0,80}$
 
@@ -576,7 +576,7 @@ enum Pattern {
                 Pattern.every($0, in: Pattern.slugChars, count: 1...100)
             }
         case .githubLogin:
-            return Pattern.every(s[...], in: Pattern.loginChars, count: 1...39)
+            return Pattern.isGithubLogin(s)
         case .model:
             return Pattern.every(s[...], in: Pattern.modelChars, count: 0...64)
         case .searchQuery:
@@ -592,5 +592,17 @@ enum Pattern {
     private static func every(_ s: Substring, in allowed: Set<Character>, count: ClosedRange<Int>) -> Bool {
         guard count.contains(s.count) else { return false }
         return s.allSatisfy { allowed.contains($0) }
+    }
+
+    // A GitHub username is alphanumeric or single hyphens, 1-39 characters, and
+    // never starts or ends with a hyphen. Charset-and-length alone (`every`
+    // above) accepted "-owner", "owner-" and "owner--name", none of which
+    // GitHub allows — same defect as the bash side of this rule, fixed the
+    // same way: reject the hyphen placements a charset check cannot see.
+    private static func isGithubLogin(_ s: String) -> Bool {
+        guard (1...39).contains(s.count) else { return false }
+        guard s.allSatisfy({ loginChars.contains($0) }) else { return false }
+        guard s.first != "-" && s.last != "-" else { return false }
+        return !s.contains("--")
     }
 }

@@ -79,6 +79,12 @@ today_review_count() {
 status_set() {
   local patch="${1:-\{\}}" cur stats
   goblin_ensure_dirs
+  # Exact-PR audits run concurrently on purpose and each one patches this same
+  # file (e.g. "reviewing #N" then "idle"). Read-patch-write through a fixed
+  # temp path is not safe under that: two audits can both read the pre-patch
+  # snapshot, and whichever mv's last wins with a patch that never saw the
+  # other's — see goblin_state_lock in core.sh.
+  goblin_state_lock status
   cur="$(cat "$STATUS" 2>/dev/null)"
   if ! printf '%s' "$cur" | jq -e . >/dev/null 2>&1; then
     cur='{"schemaVersion":1,"state":"idle","pausedReason":"","activity":"","lastRunStarted":0,"lastRunFinished":0,"nextRunEstimate":0}'
@@ -87,9 +93,11 @@ status_set() {
   if printf '%s' "$cur" | jq --argjson patch "$patch" --argjson stats "$stats" \
        '. + $patch + $stats | .schemaVersion = 1' > "$STATUS.tmp" 2>/dev/null; then
     mv "$STATUS.tmp" "$STATUS"
+    goblin_state_unlock status
     ui_state_write
   else
     rm -f "$STATUS.tmp" 2>/dev/null
+    goblin_state_unlock status
   fi
 }
 

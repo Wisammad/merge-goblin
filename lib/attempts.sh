@@ -39,16 +39,25 @@ attempt_key() {
   fi
 }
 
+# `key` is always the current "repo#pr:head" shape (see attempt_key), but an
+# install upgraded from before repo-scoping can have an active backoff filed
+# under the pre-migration "pr:head" shape. ledger_reviewed already reads both
+# shapes (state.sh); this did not, so after an upgrade an in-flight backoff
+# under the old key was invisible and the head it was protecting got retried
+# immediately instead of waiting out its delay.
 attempt_blocked() {
   local key="$1" f; f="$(attempt_file)"
   [ -f "$f" ] || return 1
-  local next; next="$(jq -r --arg k "$key" '.[$k].nextAt // 0' "$f" 2>/dev/null)"
+  local legacy="${key#*#}"
+  local next; next="$(jq -r --arg k "$key" --arg k2 "$legacy" \
+    '[.[$k].nextAt, .[$k2].nextAt] | map(select(. != null)) | max // 0' "$f" 2>/dev/null)"
   [ "${next:-0}" = "null" ] && next=0
   [ "$(now_epoch)" -lt "${next:-0}" ] 2>/dev/null
 }
 
 attempt_record() {
   local key="$1" kind="${2:-other}" f; f="$(attempt_file)"
+  goblin_state_lock attempts
   [ -f "$f" ] || echo '{}' > "$f"
   local maxa base cap n delay
   maxa="$(cfg_get '.failure.maxAttempts' 3)"
@@ -68,6 +77,7 @@ attempt_record() {
      --argjson next "$(( $(now_epoch) + delay ))" --arg kind "$kind" \
      '.[$k] = {n:$n, lastAt:$at, nextAt:$next, kind:$kind}' "$f" > "$f.tmp" 2>/dev/null \
      && mv "$f.tmp" "$f"
+  goblin_state_unlock attempts
   [ "$delay" -gt 0 ] && log "  #${key%%:*}: $n consecutive failures — holding this commit for $((delay / 60))m"
   return 0
 }
@@ -75,7 +85,10 @@ attempt_record() {
 attempt_clear() {
   local key="$1" f; f="$(attempt_file)"
   [ -f "$f" ] || return 0
-  jq --arg k "$key" 'del(.[$k])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  local legacy="${key#*#}"
+  goblin_state_lock attempts
+  jq --arg k "$key" --arg k2 "$legacy" 'del(.[$k], .[$k2])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  goblin_state_unlock attempts
 }
 
 # attempt_reason <key> — one human-readable line for the panel.

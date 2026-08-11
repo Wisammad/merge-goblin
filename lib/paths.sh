@@ -19,6 +19,7 @@ UPDATE_STATE="$GOBLIN_HOME/update.json" # last version check; see update.sh
 INBOX="$GOBLIN_HOME/inbox.json"         # waiting-PR counts for the menu bar; see inbox.sh
 LOCKDIR="$GOBLIN_HOME/.lock"
 PR_LOCKS_DIR="$GOBLIN_HOME/pr-locks"
+STATE_LOCKS_DIR="$GOBLIN_HOME/state-locks"  # brief per-file locks; see goblin_state_lock
 REPOS_DIR="$GOBLIN_HOME/repos"          # scratch clones: repos/<owner>__<name>
 RUNTMP="$GOBLIN_HOME/tmp"
 
@@ -51,7 +52,7 @@ AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 
 
 goblin_ensure_dirs() {
-  mkdir -p "$GOBLIN_HOME" "$PR_LOCKS_DIR" "$REPOS_DIR" "$RUNTMP" 2>/dev/null || true
+  mkdir -p "$GOBLIN_HOME" "$PR_LOCKS_DIR" "$STATE_LOCKS_DIR" "$REPOS_DIR" "$RUNTMP" 2>/dev/null || true
   # 700, not 755: this directory holds PR titles, spend history and raw model
   # output under last-failure/. On a shared Mac every other user could read it.
   chmod 700 "$GOBLIN_HOME" 2>/dev/null || true

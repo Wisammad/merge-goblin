@@ -113,6 +113,29 @@ pr_lock_release() {
 # Stable short hash of a string (used for finding ids and fleet assignment).
 goblin_hash() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-12; }
 
+# goblin_state_lock <name> / goblin_state_unlock <name> — a brief mutual-exclusion
+# lock around one shared state file's read-modify-write cycle.
+#
+# Exact-PR audits deliberately run concurrently now (see pr_lock_acquire above),
+# but every audit still reads-then-writes process-wide files — attempts.json,
+# status.json, update.json — through a fixed temp path. An atomic rename alone
+# does not protect a read-modify-write: two audits can both read the file before
+# either writes, and whichever renames last wins with a snapshot that never saw
+# the other's update, silently dropping it (e.g. one PR's failure backoff).
+# Held only around the write itself, never around a whole review.
+goblin_state_lock() {
+  local dir="$STATE_LOCKS_DIR/$(goblin_hash "$1")" tries=0
+  mkdir -p "$STATE_LOCKS_DIR" 2>/dev/null
+  while ! lock_acquire "$dir"; do
+    tries=$((tries + 1))
+    # ~10s of real contention is not a healthy lock; proceed unlocked rather
+    # than hang a review forever over a state file.
+    [ "$tries" -ge 100 ] && return 1
+    sleep 0.1
+  done
+}
+goblin_state_unlock() { lock_release "$STATE_LOCKS_DIR/$(goblin_hash "$1")"; }
+
 # atomic_write <dest> — write stdin to dest via a temp file in the same directory.
 #
 # The menu bar app watches these files and re-reads on every change, so a reader

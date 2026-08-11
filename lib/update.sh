@@ -85,6 +85,10 @@ update_check() {
   if [ -n "$latest" ] && update_newer "$latest" "$GOBLIN_VERSION"; then avail=true; fi
   [ -n "$latest" ] || latest="$(update_field '.latest' '')"
 
+  # Exact-PR audits can run concurrently and each calls update_check at the end
+  # of its own run; see goblin_state_lock in core.sh for why a fixed temp path
+  # is not safe under that even though this file is low-traffic.
+  goblin_state_lock update
   jq -nc --arg latest "$latest" --arg current "$GOBLIN_VERSION" \
      --arg url "$GOBLIN_REPO_URL" --argjson avail "$avail" \
      --argjson at "$(now_epoch)" \
@@ -92,6 +96,7 @@ update_check() {
      > "$UPDATE_STATE.tmp" 2>/dev/null \
     && mv "$UPDATE_STATE.tmp" "$UPDATE_STATE" \
     || rm -f "$UPDATE_STATE.tmp" 2>/dev/null
+  goblin_state_unlock update
   return 0
 }
 

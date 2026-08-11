@@ -148,6 +148,36 @@ test_pr_locks_allow_distinct_audits() (
   teardown
 )
 
+test_state_lock_excludes_concurrent_holders() (
+  setup
+  goblin_state_lock testlock || return 1
+  local dir="$STATE_LOCKS_DIR/$(goblin_hash testlock)"
+  [ -d "$dir" ] || { echo "the lock left no directory behind"; return 1; }
+  # Exercise the exact primitive goblin_state_lock retries on, without waiting
+  # out its ~10s retry budget: a second holder must not be able to mkdir it.
+  mkdir "$dir" 2>/dev/null && { echo "two holders could mkdir the same lock dir"; return 1; }
+  ( goblin_state_lock otherlock && goblin_state_unlock otherlock ) || {
+    echo "an unrelated lock name was blocked too"; return 1;
+  }
+  goblin_state_unlock testlock
+  [ -d "$dir" ] && { echo "unlock left the directory behind"; return 1; }
+  goblin_state_lock testlock || { echo "could not re-acquire after unlock"; return 1; }
+  goblin_state_unlock testlock
+  teardown
+)
+
+test_shared_state_writers_are_locked() {
+  # Exact-PR audits run concurrently on purpose (see pr_lock_acquire) and share
+  # these process-wide files through a fixed temp path; a read-modify-write
+  # without a lock around it can silently lose one audit's update.
+  grep -q 'goblin_state_lock attempts' "$ROOT/lib/attempts.sh" \
+    || { echo "attempts.json writes are no longer lock-protected"; return 1; }
+  grep -q 'goblin_state_lock status' "$ROOT/lib/state.sh" \
+    || { echo "status.json writes are no longer lock-protected"; return 1; }
+  grep -q 'goblin_state_lock update' "$ROOT/lib/update.sh" \
+    || { echo "update.json writes are no longer lock-protected"; return 1; }
+}
+
 # -------------------------------------------------------------- findings ---
 test_validate_accepts_minimal() {
   setup
@@ -325,10 +355,15 @@ test_adapters_are_loaded_in_the_callers_shell() {
   teardown
 }
 
-test_reviewer_routing_from_contributor_signatures() {
+test_reviewer_routing_from_contributor_signatures() (
   setup
   . "$ROOT/lib/reviewers.sh"
   local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # This test is about signature-based routing, not availability — every
+  # provider is installed and authed here so that logic alone decides.
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
 
   echo 'Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>' > "$evidence"
   reviewers_plan "$evidence" "$plan"
@@ -351,7 +386,7 @@ test_reviewer_routing_from_contributor_signatures() {
   eq "claude:opus codex:" \
     "$(jq -r '.reviewers[] | .provider + ":" + .modelOverride' "$plan" | paste -sd' ' -)" || return 1
   teardown
-}
+)
 
 test_reviewers_start_in_parallel() (
   setup
@@ -420,10 +455,48 @@ JSON
   teardown
 }
 
-test_every_contributor_is_excluded() {
+test_merge_keeps_one_reviewers_own_findings_apart() {
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local work="$GOBLIN_HOME/work"; mkdir -p "$work"
+  cat > "$work/plan.json" <<'JSON'
+{"contributor":{"detected":true,"provider":"claude","label":"Claude","matches":2,"signal":"Co-Authored-By: Claude"},"reviewers":[{"provider":"codex","label":"OpenAI Codex","modelOverride":""},{"provider":"cursor","label":"Cursor","modelOverride":""}]}
+JSON
+  # Position alone is not a safe merge key: codex raises TWO distinct findings
+  # on the same line here. Grouping by position only collapsed them into one,
+  # keeping the first finding's title/severity/suggestion and burying the
+  # second's under it as extra body text — the opposite of "merging is
+  # lossless". They must stay two findings.
+  cat > "$work/norm-codex.json" <<'JSON'
+{"summary":"Codex summary","findings":[
+  {"id":"codex-id-1","severity":"blocker","title":"Unquoted expansion","body":"Splits on whitespace","path":"a.ts","line":9,"suggestion":"quote it"},
+  {"id":"codex-id-2","severity":"nit","title":"Prefer a case statement","body":"Cleaner than nested if","path":"a.ts","line":9}
+],"intent_note":null}
+JSON
+  cat > "$work/norm-cursor.json" <<'JSON'
+{"summary":"Cursor summary","findings":[],"intent_note":null}
+JSON
+  echo '{"provider":"codex","ok":true,"model":"gpt-test","costUsd":0,"durationMs":1}' > "$work/meta-codex.json"
+  echo '{"provider":"cursor","ok":true,"model":"cursor-test","costUsd":0,"durationMs":1}' > "$work/meta-cursor.json"
+  reviewers_merge "$work/plan.json" "$work" "$work/merged.json" "$work/final.json" || return 1
+  eq "2" "$(jq '.findings | length' "$work/merged.json")" \
+    || { echo "two distinct same-reviewer findings at one line collapsed into one"; return 1; }
+  jq -e '.findings[] | select(.title == "Unquoted expansion") | .severity == "blocker" and .suggestion == "quote it"' \
+    "$work/merged.json" >/dev/null || { echo "the first finding lost its own fields"; return 1; }
+  jq -e '.findings[] | select(.title == "Prefer a case statement") | .severity == "nit"' \
+    "$work/merged.json" >/dev/null || { echo "the second finding was buried instead of kept distinct"; return 1; }
+  teardown
+}
+
+test_every_contributor_is_excluded() (
   setup
   . "$ROOT/lib/reviewers.sh"
   local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # This test is about signature-based exclusion, not availability — every
+  # provider is installed and authed here so that logic alone decides.
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
 
   # Two agents co-authored this branch. Excluding only the top scorer sent the
   # review straight back to the other one — and on a tie the "top" scorer was
@@ -437,12 +510,17 @@ test_every_contributor_is_excluded() {
   jq -e '.note != ""' "$plan" >/dev/null || { echo "the single-reviewer limitation was not recorded"; return 1; }
   eq "true" "$(jq -r '.independent' "$plan")" || return 1
   teardown
-}
+)
 
-test_all_agents_contributed_is_disclosed() {
+test_all_agents_contributed_is_disclosed() (
   setup
   . "$ROOT/lib/reviewers.sh"
   local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # No signature excludes every provider here; every provider is also
+  # installed, so which one reviews is decided by match count alone.
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
 
   # Nothing independent is available. Reviewing anyway is right — silently
   # calling the result independent is not.
@@ -456,7 +534,48 @@ test_all_agents_contributed_is_disclosed() {
   jq -e '.note | test("not independent|reviewing its own work")' "$plan" >/dev/null \
     || { echo "a self-review was not disclosed as one"; return 1; }
   teardown
-}
+)
+
+test_independent_reviewer_must_be_installed() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # Claude authored this PR. Codex and cursor carry no signature, so a plan
+  # that only excludes contributors would pick them both — but neither is on
+  # this machine, so both would fail every single time.
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":false,"authed":false}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+
+  printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n' > "$evidence"
+  reviewers_plan "$evidence" "$plan"
+  eq "1" "$(jq '.reviewers | length' "$plan")" || return 1
+  eq "claude" "$(jq -r '.reviewers[0].provider' "$plan")" \
+    || { echo "planned a reviewer that is not installed on this machine"; return 1; }
+  eq "false" "$(jq -r '.independent' "$plan")" || return 1
+  jq -e '.note | test("not installed|not authenticated")' "$plan" >/dev/null \
+    || { echo "the fallback to an unavailable-independent-reviewer machine was not disclosed"; return 1; }
+  teardown
+)
+
+test_independent_and_available_reviewer_is_used() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local evidence="$GOBLIN_HOME/evidence" plan="$GOBLIN_HOME/plan.json"
+  # Claude authored the PR; codex is installed but cursor is not. Exactly one
+  # independent AND available reviewer exists, so it reviews alone rather than
+  # falling all the way back to a disclosed self-review.
+  provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
+  provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
+  provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+
+  printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n' > "$evidence"
+  reviewers_plan "$evidence" "$plan"
+  eq "1" "$(jq '.reviewers | length' "$plan")" || return 1
+  eq "codex" "$(jq -r '.reviewers[0].provider' "$plan")" || return 1
+  eq "true" "$(jq -r '.independent' "$plan")" || return 1
+  teardown
+)
 
 test_reviewers_survive_one_failure() (
   setup
@@ -901,6 +1020,23 @@ test_installer_refuses_a_login_that_is_not_one() {
   eq "Wisammad" "$got" || return 1
 }
 
+test_github_login_rejects_bad_hyphen_placement() {
+  local re='^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}$'
+  # The flat charset ^[A-Za-z0-9-]{1,39}$ this replaced accepted every one of
+  # these; GitHub's own username rule allows none of them.
+  local bad
+  for bad in '-owner' 'owner-' 'owner--name'; do
+    if ( _lift_ask_valid; ask_valid "$re" c p "$bad" ) >/dev/null 2>&1; then
+      echo "accepted invalid github login: $bad"; return 1
+    fi
+  done
+  local good got
+  for good in 'the-real-user' 'a1-b2-c3'; do
+    got="$( _lift_ask_valid; ask_valid "$re" c p "$good" )" || { echo "rejected a valid login: $good"; return 1; }
+    eq "$good" "$got" || return 1
+  done
+}
+
 test_every_config_answer_is_validated() {
   # A bare `ask` for a config value is how an email became an identity. All three
   # configuration answers go through ask_valid. (The y/n migration prompt is not
@@ -916,9 +1052,13 @@ test_every_config_answer_is_validated() {
 
 test_installer_login_rule_matches_the_other_writers() {
   # Three writers, one rule. If they drift, one door stays open.
-  local rule='A-Za-z0-9-]{1,39}'
+  #
+  # The flat charset ^[A-Za-z0-9-]{1,39}$ this used to check for accepted
+  # "-owner", "owner-" and "owner--name" — none of which GitHub allows, and
+  # the shared substring below is what actually rejects them in all three.
+  local rule='(-?[A-Za-z0-9]){0,38}'
   for f in install.sh lib/cmd_panel.sh app/Command.swift; do
-    grep -q "$rule" "$ROOT/$f" || { echo "$f no longer enforces the login shape"; return 1; }
+    grep -qF "$rule" "$ROOT/$f" || { echo "$f no longer enforces the login shape"; return 1; }
   done
 }
 
@@ -1140,6 +1280,20 @@ test_attempt_keys_are_repo_scoped() {
   eq "acme/one#7:aaa" "$(attempt_key acme/one 7 aaa)" || return 1
   eq "7:aaa" "$(attempt_key '' 7 aaa)" || return 1
   eq "7:aaa" "$(attempt_key 7 aaa)" || return 1
+  teardown
+}
+
+test_attempt_blocked_reads_the_legacy_key_too() {
+  setup
+  local f; f="$(attempt_file)"
+  # An install upgraded from before repo-scoping can have an active backoff
+  # filed under the pre-migration "pr:head" shape. ledger_reviewed already
+  # reads both shapes (state.sh); attempt_blocked did not, so after an upgrade
+  # a head that was mid-backoff got retried immediately instead of waiting.
+  printf '{"7:aaa":{"n":5,"lastAt":0,"nextAt":%s,"kind":"other"}}' "$(( $(now_epoch) + 3600 ))" > "$f"
+  attempt_blocked "acme/one#7:aaa" || { echo "a legacy-keyed backoff was ignored"; return 1; }
+  attempt_clear "acme/one#7:aaa"
+  attempt_blocked "acme/one#7:aaa" && { echo "attempt_clear left the legacy key behind"; return 1; }
   teardown
 }
 
@@ -1672,6 +1826,8 @@ t "state: stats from events"             test_stats_from_events
 t "state: dedup ledger"                  test_ledger
 t "state: ledger is repo scoped"         test_ledger_is_repo_scoped
 t "state: distinct PR locks coexist"     test_pr_locks_allow_distinct_audits
+t "state: state lock excludes holders"   test_state_lock_excludes_concurrent_holders
+t "state: shared state writers are locked" test_shared_state_writers_are_locked
 t "findings: validate minimal"           test_validate_accepts_minimal
 t "findings: reject bad severity"        test_validate_rejects_bad_severity
 t "findings: reject empty body"          test_validate_rejects_empty_body
@@ -1688,8 +1844,11 @@ t "providers: adapters load in caller shell" test_adapters_are_loaded_in_the_cal
 t "reviewers: routes away from contributor" test_reviewer_routing_from_contributor_signatures
 t "reviewers: start concurrently"          test_reviewers_start_in_parallel
 t "reviewers: merge with provenance"       test_reviewer_results_merge_with_provenance
+t "reviewers: same reviewer's findings stay apart" test_merge_keeps_one_reviewers_own_findings_apart
 t "reviewers: every contributor excluded"  test_every_contributor_is_excluded
 t "reviewers: self-review is disclosed"    test_all_agents_contributed_is_disclosed
+t "reviewers: independent must be installed" test_independent_reviewer_must_be_installed
+t "reviewers: uses the one available independent reviewer" test_independent_and_available_reviewer_is_used
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
 t "reviewers: zero reviewers still fails"  test_zero_reviewers_is_still_a_failure
 t "fleet: assignment deterministic"      test_assignment_is_deterministic_and_spread
@@ -1720,6 +1879,7 @@ t "engine: discovers user PRs globally"  test_user_pr_discovery_across_repos
 t "engine: pr url routing"               test_url_target_routing
 t "engine: manual mode is gone"          test_manual_mode_is_gone
 t "engine: attempt keys are repo scoped" test_attempt_keys_are_repo_scoped
+t "engine: attempt_blocked reads legacy key" test_attempt_blocked_reads_the_legacy_key_too
 t "engine: exact audits isolate checkout" test_exact_audits_use_isolated_checkouts
 t "security: no token reaches the model" test_no_token_reaches_the_model
 t "security: caller env restored"        test_callers_environment_is_restored
@@ -1743,6 +1903,7 @@ t "panel: csp forbids inline"            test_panel_csp_forbids_inline
 t "panel: no html injection sinks"       test_panel_has_no_html_injection_sinks
 t "app: build stages before swapping"    test_app_build_stages_before_swapping
 t "identity: installer refuses non-login" test_installer_refuses_a_login_that_is_not_one
+t "identity: rejects bad hyphen placement" test_github_login_rejects_bad_hyphen_placement
 t "identity: every answer is validated"  test_every_config_answer_is_validated
 t "identity: one login rule, 3 writers"  test_installer_login_rule_matches_the_other_writers
 t "identity: doctor names gh's account"  test_doctor_names_the_account_gh_actually_has

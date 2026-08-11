@@ -135,8 +135,12 @@ say "  · the github account the reviews are posted from."
 say "       your github username — not an email, not a password."
 CUR_LOGIN="$(cfg_get '.identity.githubLogin' '')"
 [ -z "$CUR_LOGIN" ] && CUR_LOGIN="$(gh api user --jq .login 2>/dev/null)"
-if ! LOGIN="$(ask_valid '^[A-Za-z0-9-]{1,39}$' \
-      "a github username is letters, digits and dashes — an email is not one" \
+# A GitHub username is alphanumeric or single hyphens, and never starts or
+# ends with one — ^[A-Za-z0-9-]{1,39}$ alone accepted "-owner", "owner-" and
+# "owner--name", none of which GitHub allows, and none of which "not an email"
+# ever caught. See lib/cmd_panel.sh and app/Command.swift: one login rule.
+if ! LOGIN="$(ask_valid '^[A-Za-z0-9](-?[A-Za-z0-9]){0,38}$' \
+      "a github username is letters, digits and single dashes, never leading/trailing — an email is not one" \
       "  github username" "$CUR_LOGIN")"; then
   err "'$CUR_LOGIN' is not a github username — set one and re-run:"
   say "        $GOBLIN_SLUG config set .identity.githubLogin <username>"
