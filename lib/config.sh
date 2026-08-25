@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # config.sh — the config plane. Ported from prauto-lib.sh, same function names.
 
-GOBLIN_CONFIG_SCHEMA_VERSION=2
+GOBLIN_CONFIG_SCHEMA_VERSION=4
 
 # Defaults are also the migration target: cfg_backfill adds any missing key
 # without ever overwriting a user's value.
@@ -17,7 +17,7 @@ goblin_default_config() {
   "providers": {
     "claude": { "model": "sonnet", "bin": "" },
     "codex":  { "model": "", "reasoningEffort": "medium", "bin": "" },
-    "cursor": { "model": "", "bin": "" }
+    "cursor": { "model": "$GOBLIN_CURSOR_DEFAULT_MODEL", "bin": "" }
   },
   "providerFallback": [],
   "timeoutSecs": 900,
@@ -39,8 +39,10 @@ goblin_default_config() {
   "refsForbidden": false,
   "refsForbiddenAt": 0,
   "update": { "notify": true, "checkEverySecs": 86400 },
-  "maxReviewsPerDay": 20,
+  "maxReviewsPerDay": 30,
   "skipIfHumanReviewed": true,
+  "sweepUntilClean": true,
+  "maxPassesPerPr": 5,
   "setupComplete": false,
   "cache": { "reposTtlSecs": 3600 }
 }
@@ -87,10 +89,43 @@ cfg_set() {
 # `*` in jq is a recursive merge where the RIGHT side wins, so defaults go left.
 cfg_backfill_defaults() {
   cfg_ensure
-  local merged
+  local was merged
+  # Read the version BEFORE the merge stamps the new one on: cfg_migrate_values
+  # needs to know where this install is coming from.
+  was="$(cfg_get '.schemaVersion' 0)"
   merged="$(jq -s '.[0] * .[1] | .schemaVersion = '"$GOBLIN_CONFIG_SCHEMA_VERSION" \
     <(goblin_default_config) "$CONFIG" 2>/dev/null)"
   [ -n "$merged" ] && printf '%s\n' "$merged" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+  cfg_migrate_values "$was"
+}
+
+# One-time value migrations, for the case the merge above cannot serve: a default
+# that CHANGED. That merge only ever adds a missing key and never overwrites a
+# value the user holds — and `""` is a value, so a new default is invisible to
+# every install that already exists. Each step names the version it upgrades TO,
+# touches only a value the user demonstrably never chose, and is idempotent.
+cfg_migrate_values() {
+  local was="${1:-0}"
+  case "$was" in ''|*[!0-9]*) was=0 ;; esac
+
+  # v3: cursor reviewed with whatever `auto` resolved to, which is chosen for
+  # cost and not for reading code. Installs that never picked a model move to
+  # the same explicit default a fresh install now gets; anyone who did pick one
+  # — including a deliberate blank, meaning "let the CLI decide" — keeps it.
+  if [ "$was" -lt 3 ]; then
+    cfg_set --arg m "$GOBLIN_CURSOR_DEFAULT_MODEL" \
+      'if ((.providers.cursor.model // "") == "") then .providers.cursor.model = $m else . end'
+  fi
+
+  # v4: default maxReviewsPerDay raised from 20 to 30. There is no blank-string
+  # sentinel to tell "never touched" apart from "deliberately set to 20" here,
+  # so — same trade-off as every value migration in this function — an install
+  # sitting exactly on the old default moves to the new one once; a cap anyone
+  # picked on purpose, 20 included, cannot be told apart from that and moves
+  # too. Idempotent: it only ever fires once per install, at the "was < 4" gate.
+  if [ "$was" -lt 4 ]; then
+    cfg_set 'if (.maxReviewsPerDay == 20) then .maxReviewsPerDay = 30 else . end'
+  fi
 }
 
 # --- repos ----------------------------------------------------------------

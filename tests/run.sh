@@ -50,7 +50,7 @@ test_config_defaults() {
   setup
   eq "true"    "$(cfg_get '.enabled' x)"        || return 1
   eq "comment" "$(cfg_get '.verdictMode' x)"    || return 1
-  eq "2"       "$(cfg_get '.schemaVersion' x)"  || return 1
+  eq "4"       "$(cfg_get '.schemaVersion' x)"  || return 1
   eq "fallback" "$(cfg_get '.nope.missing' fallback)" || return 1
   teardown
 }
@@ -165,6 +165,21 @@ test_pr_lock_staleness_scales_with_configured_timeout() (
   touch -t "$(date -v-300M '+%Y%m%d%H%M')" "$dir"
   ( PR_LOCKDIR=""; pr_lock_acquire acme/repo 9 && pr_lock_release ) \
     || { echo "a genuinely abandoned PR lock was never reclaimed"; return 1; }
+  teardown
+)
+
+test_pr_lock_release_survives_never_having_locked() (
+  setup
+  # pr_lock_release runs from the engine's EXIT trap, including on every path
+  # that returns before a PR lock was ever taken — a failed auth check, a closed
+  # gate, an interrupted sweep pass. Under `set -u` an unset PR_LOCKDIR aborts
+  # the trap MID-LIST, so the reservation_release and lock_release queued behind
+  # it never run and the crash-safety net quietly stops catching.
+  ( set -u; unset PR_LOCKDIR; pr_lock_release ) || {
+    echo "pr_lock_release fails when no lock was ever held"; return 1; }
+  ( set -u; unset PR_LOCKDIR
+    pr_lock_release; echo "reached" > "$GOBLIN_HOME/after" ) >/dev/null 2>&1
+  [ -f "$GOBLIN_HOME/after" ] || { echo "the trap aborted after pr_lock_release"; return 1; }
   teardown
 )
 
@@ -1365,6 +1380,12 @@ test_url_target_routing() (
   . "$ROOT/lib/engine.sh"
   local calls="$GOBLIN_HOME/calls"
   cmd_run() { printf '%s\n' "$*" >> "$calls"; }
+  # A pasted link sweeps (engine_sweep); --once is the single-review escape.
+  engine_sweep() { printf 'sweep %s %s\n' "$1" "$2" >> "$calls"; }
+  cmd_url 'https://github.com/acme/nine/pull/3' || return 1
+  eq "sweep acme/nine 3" "$(cat "$calls")" || return 1
+  : > "$calls"
+  cfg_set '.sweepUntilClean = false'
   cmd_url 'https://github.com/acme/four/pull/19' || return 1
   # Browsers hand out links with tracking params and a #files anchor; a link you
   # can paste is only easier than typing OWNER/REPO#N if it survives being pasted.
@@ -1378,6 +1399,12 @@ test_url_target_routing() (
 --repo acme/five --pr 23 --force
 --repo acme/six --pr 7 --force
 --repo acme/six --pr 7 --force" "$(cat "$calls")" || return 1
+  # --once wins even with sweeping enabled, and reaches cmd_run as an argument
+  # it must recognise rather than reject.
+  cfg_set '.sweepUntilClean = true'
+  : > "$calls"
+  cmd_url 'https://github.com/acme/ten/pull/4' --once || return 1
+  eq "--repo acme/ten --pr 4 --force --once" "$(cat "$calls")" || return 1
   # Anything that is not a PR link is refused rather than half-parsed.
   cmd_url 'https://github.com/acme/four/issues/19' >/dev/null 2>&1 && return 1
   cmd_url 'acme/four#19'  >/dev/null 2>&1 && return 1
@@ -1385,6 +1412,291 @@ test_url_target_routing() (
   cmd_url ''              >/dev/null 2>&1 && return 1
   teardown
 )
+
+# ------------------------------------------------------------------ sweep ---
+# A stub pass that reads its script from a file, one line per pass:
+#   N       posted N findings, all with ids new to this sweep
+#   sameN   posted N findings reusing pass 1's ids — what a finding GitHub
+#           never anchored inline looks like on the pass after it
+#   none    the pass wrote no result at all (gated, crashed, interrupted)
+#   <text>  any other outcome, e.g. a failure or the daily cap
+# That keeps every sweep test to a single readable line.
+sweep_script() { printf '%s\n' "$@" > "$GOBLIN_HOME/sweep-script"; : > "$GOBLIN_HOME/sweep-passes"; }
+sweep_ids() {  # <tag> <count> -> a json array of that many ids under that tag
+  local tag="$1" cnt="$2" ids='[]' i=0
+  while [ "$i" -lt "$cnt" ]; do
+    ids="$(printf '%s' "$ids" | jq -c --arg id "$tag-$i" '. + [$id]')"; i=$((i + 1))
+  done
+  printf '%s' "$ids"
+}
+sweep_stub_pass() {
+  local n step cnt tag
+  n=$(( $(wc -l < "$GOBLIN_HOME/sweep-passes" 2>/dev/null || echo 0) + 1 ))
+  echo "pass $n" >> "$GOBLIN_HOME/sweep-passes"
+  step="$(sed -n "${n}p" "$GOBLIN_HOME/sweep-script")"
+  case "$step" in
+    ''|none) return 1 ;;
+    same*)   cnt="${step#same}"; tag="pass1" ;;
+    [0-9]*)  cnt="$step";        tag="pass$n" ;;
+    *)       jq -nc --arg o "$step" '{outcome:$o,findings:0,head:"abc",ids:[]}' > "$3"; return 0 ;;
+  esac
+  jq -nc --argjson f "$cnt" --argjson ids "$(sweep_ids "$tag" "$cnt")" \
+    '{outcome:"posted",findings:$f,head:"abc",ids:$ids}' > "$3"
+}
+sweep_passes() { wc -l < "$GOBLIN_HOME/sweep-passes" 2>/dev/null | tr -d ' '; }
+
+test_sweep_runs_until_a_pass_finds_nothing_new() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  # Three new findings, then one, then nothing — the manual restart loop this
+  # replaces, and the only outcome that ends a sweep successfully.
+  sweep_script 3 1 0
+  engine_sweep acme/repo 42 >/dev/null || return 1
+  eq "3" "$(sweep_passes)" || return 1
+  teardown
+)
+
+test_sweep_stops_when_a_pass_does_not_post() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  # Anything that is not "posted something new" ends it: a failure, the daily
+  # cap, the PR merging underneath the sweep. Never spin on a no-op.
+  sweep_script 2 "the review itself failed" 5
+  engine_sweep acme/repo 42 >/dev/null && return 1
+  eq "2" "$(sweep_passes)" || return 1
+  teardown
+)
+
+test_sweep_stops_when_a_pass_reports_no_outcome() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  # A pass that was gated, crashed or was interrupted leaves no result file.
+  # Absence must read as "stop", never as "found nothing, we are done".
+  sweep_script 4 none 1
+  engine_sweep acme/repo 42 >/dev/null && return 1
+  eq "2" "$(sweep_passes)" || return 1
+  teardown
+)
+
+test_sweep_stops_on_findings_it_has_already_seen() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  # GitHub's own dedupe cannot close this loop: it reads the INLINE comments on
+  # the PR, and a finding on a line outside the diff is never one — it is
+  # demoted into the review body, invisible to the next pass, and re-raised by
+  # every pass forever. A pass whose findings are all ids this sweep has already
+  # seen has added nothing, however many it posted.
+  sweep_script 2 same2 3
+  engine_sweep acme/repo 42 >/dev/null || return 1
+  eq "2" "$(sweep_passes)" || return 1
+  teardown
+)
+
+test_sweep_honours_the_pass_cap() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  # A model that keeps finding something must still cost a bounded number of
+  # reviews: every pass spends a maxReviewsPerDay slot and real provider money.
+  sweep_script 1 1 1 1 1 1 1 1
+  cfg_set '.maxPassesPerPr = 3'
+  engine_sweep acme/repo 42 >/dev/null && return 1
+  eq "3" "$(sweep_passes)" || return 1
+  # An explicit --max-passes overrides the configured ceiling.
+  : > "$GOBLIN_HOME/sweep-passes"
+  engine_sweep acme/repo 42 2 >/dev/null && return 1
+  eq "2" "$(sweep_passes)" || return 1
+  teardown
+)
+
+test_sweep_pass_cannot_start_its_own_sweep() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local calls="$GOBLIN_HOME/calls"
+  engine_sweep_pass() { echo "spawned" >> "$calls"; }
+  cmd_run() { printf 'run %s\n' "$*" >> "$calls"; }
+  # A stray --until-clean reaching a pass must cost one review, not fork
+  # reviews without end.
+  GOBLIN_SWEEP=1 engine_sweep acme/repo 42 >/dev/null || return 1
+  eq "run --repo acme/repo --pr 42 --force" "$(cat "$calls")" || return 1
+  teardown
+)
+
+test_sweep_handoff_does_not_re_enter_itself() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  # The REAL cmd_run this time. UNTIL_CLEAN is a global that outlives the call,
+  # so handing back to cmd_run without clearing it means cmd_run parses its
+  # three arguments, still sees the flag set, and walks straight back into
+  # engine_sweep — for as long as the stack holds. One review, once.
+  local gates="$GOBLIN_HOME/gates"
+  engine_gates() { echo "gated" >> "$gates"; return 1; }
+  engine_sweep_pass() { echo "spawned" >> "$GOBLIN_HOME/calls"; }
+  GOBLIN_SWEEP=1 cmd_run --repo acme/repo --pr 42 --until-clean >/dev/null 2>&1
+  eq "1" "$(wc -l < "$gates" | tr -d ' ')" || return 1
+  [ -f "$GOBLIN_HOME/calls" ] && { echo "a pass spawned another pass"; return 1; }
+  teardown
+)
+
+test_sweep_needs_an_unambiguous_target() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { echo spawned >> "$GOBLIN_HOME/calls"; }
+  # No PR: there is nothing to converge on.
+  engine_sweep "" "" >/dev/null 2>&1 && return 1
+  # No repo, and two configured: guessing which #7 someone meant is how you
+  # review the wrong PR.
+  cfg_repo_add acme/one; cfg_repo_add acme/two
+  engine_sweep "" 7 >/dev/null 2>&1 && return 1
+  [ -f "$GOBLIN_HOME/calls" ] && { echo "an ambiguous target was reviewed anyway"; return 1; }
+  # No repo, exactly one configured, is not ambiguous.
+  cfg_repo_rm acme/two
+  engine_sweep_pass() { jq -nc '{outcome:"posted",findings:0,head:"a"}' > "$3"; }
+  engine_sweep "" 7 >/dev/null || return 1
+  teardown
+)
+
+test_plan_never_sweeps() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  # --plan posts nothing, so pass 2 would read exactly what pass 1 read. The
+  # real danger is the reverse: a sweep pass never carries --plan, so silently
+  # sweeping a dry run would spend real reviews on a request to spend none.
+  engine_sweep() { echo "swept" >> "$GOBLIN_HOME/calls"; }
+  engine_gates() { return 1; }
+  cmd_run --pr 7 --repo acme/repo --until-clean --plan >/dev/null 2>&1
+  [ -f "$GOBLIN_HOME/calls" ] && { echo "a dry run swept"; return 1; }
+  teardown
+)
+
+test_pass_result_is_written_only_when_asked() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  unset GOBLIN_PASS_RESULT
+  engine_pass_write posted 3 abc123 || return 1     # no-op, and must not fail
+  local f="$GOBLIN_HOME/pass.json"
+  GOBLIN_PASS_RESULT="$f" engine_pass_write posted 3 abc123 '["a","b","c"]' || return 1
+  jq -e '.outcome == "posted" and .findings == 3 and .head == "abc123"
+         and .ids == ["a","b","c"]' "$f" >/dev/null || return 1
+  # Anything that is not a JSON array becomes one, so the sweep never has to
+  # parse-check what it reads back.
+  GOBLIN_PASS_RESULT="$f" engine_pass_write posted 1 abc123 'not json' || return 1
+  jq -e '.ids == []' "$f" >/dev/null || return 1
+  # A --max-passes that is not a positive number is refused, not silently
+  # rounded to the default: a sweep's cost is the one thing not to guess at.
+  cmd_run --pr 7 --repo acme/repo --until-clean --max-passes abc >/dev/null 2>&1 && return 1
+  cmd_run --pr 7 --repo acme/repo --until-clean --max-passes 0 >/dev/null 2>&1 && return 1
+  # A reason with spaces and a dollar sign still yields valid JSON — the sweep
+  # reads these back and prints them to a terminal.
+  GOBLIN_PASS_RESULT="$f" engine_pass_write 'the $10 daily budget is spent ($10.40)' || return 1
+  jq -e '.findings == 0 and (.outcome | test("daily budget"))' "$f" >/dev/null || return 1
+  teardown
+)
+
+test_no_fixed_replies_without_a_new_commit() {
+  # A re-review of the SAME commit drops every finding already posted before it
+  # reaches post_fixed_replies, so all of those threads look resolved. Replying
+  # "no longer flagged" there marks live bugs as fixed — and a sweep would do it
+  # on every pass. The guard is the head having actually changed.
+  grep -B14 -F 'post_fixed_replies "$slug" "$pr" "$prior_json" "$work/curids.json" "$head"' \
+    "$ROOT/lib/engine.sh" | grep -qF '[ "$last_sha" != "$head" ]' \
+    || { echo "fixed-replies are not gated on the commit changing"; return 1; }
+  # And last_sha has to actually reach engine_publish, or the guard reads an
+  # empty variable and is always true.
+  grep -qF 'engine_publish "$work" "$slug" "$pr" "$head" "$base" "$title" "$url" "$provider" "$prior_json" "$last_sha"' \
+    "$ROOT/lib/engine.sh" || { echo "engine_publish is not told the prior sha"; return 1; }
+  return 0
+}
+
+# ----------------------------------------------------------------- cursor ---
+test_cursor_defaults_to_the_named_grok() {
+  setup
+  # Cursor's own default is `auto`, which picks for cost rather than for reading
+  # code, so the Goblin names a model.
+  eq "$GOBLIN_CURSOR_DEFAULT_MODEL" "$(cfg_get '.providers.cursor.model' x)" || return 1
+  case "$GOBLIN_CURSOR_DEFAULT_MODEL" in
+    cursor-grok-4.6-*) ;;
+    *) echo "the default is no longer a Grok 4.6 id: $GOBLIN_CURSOR_DEFAULT_MODEL"; return 1 ;;
+  esac
+  # The panel offers it too: a picker that cannot reach the configured model is
+  # a picker that silently changes it.
+  grep -qF "'$GOBLIN_CURSOR_DEFAULT_MODEL'" "$ROOT/share/ui/panel.js" \
+    || { echo "the panel does not offer $GOBLIN_CURSOR_DEFAULT_MODEL"; return 1; }
+  teardown
+}
+
+test_changed_default_reaches_an_existing_install() {
+  setup
+  # cfg_backfill_defaults only ever ADDS a missing key and never overwrites a
+  # value — and "" is a value, so a changed default is invisible to every
+  # install that already exists unless cfg_migrate_values moves it.
+  cfg_set '.schemaVersion = 2 | .providers.cursor.model = ""'
+  cfg_backfill_defaults
+  eq "$GOBLIN_CURSOR_DEFAULT_MODEL" "$(cfg_get '.providers.cursor.model' x)" || return 1
+  eq "4" "$(cfg_get '.schemaVersion' x)" || return 1
+
+  # A model somebody actually chose is never touched.
+  cfg_set '.schemaVersion = 2 | .providers.cursor.model = "composer-2.5"'
+  cfg_backfill_defaults
+  eq "composer-2.5" "$(cfg_get '.providers.cursor.model' x)" || return 1
+
+  # Idempotent: at v3 a blank is a deliberate "let the CLI decide", so a second
+  # backfill must leave it blank rather than re-applying the migration forever.
+  cfg_set '.providers.cursor.model = ""'
+  cfg_backfill_defaults
+  eq "" "$(cfg_get '.providers.cursor.model' '')" || return 1
+  teardown
+}
+
+test_max_reviews_per_day_default_reaches_an_existing_install() {
+  setup
+  # An install that was sitting on the old default (20) moves to the new one
+  # (30) the next time any command runs a backfill — no reinstall required.
+  cfg_set '.schemaVersion = 3 | .maxReviewsPerDay = 20'
+  cfg_backfill_defaults
+  eq "30" "$(cfg_get '.maxReviewsPerDay' x)" || return 1
+  eq "4"  "$(cfg_get '.schemaVersion' x)"    || return 1
+
+  # A cap somebody actually chose, old-default-shaped or not, is never touched.
+  cfg_set '.schemaVersion = 3 | .maxReviewsPerDay = 15'
+  cfg_backfill_defaults
+  eq "15" "$(cfg_get '.maxReviewsPerDay' x)" || return 1
+
+  # Idempotent: once at v4, a value equal to 20 is a deliberate choice and a
+  # second backfill must leave it alone rather than re-applying it forever.
+  cfg_set '.maxReviewsPerDay = 20'
+  cfg_backfill_defaults
+  eq "20" "$(cfg_get '.maxReviewsPerDay' x)" || return 1
+  teardown
+}
+
+test_cursor_falls_back_when_the_cli_rejects_the_model() {
+  setup
+  . "$ROOT/lib/providers.sh"; providers_load
+  local raw="$GOBLIN_HOME/raw"; mkdir -p "$raw"
+  local seen="$GOBLIN_HOME/seen"; : > "$seen"
+  # Naming a model the installed cursor-agent does not know is an immediate
+  # refusal, not a review that failed. Without the retry, every review on a
+  # cursor-agent older than that id fails with an opaque provider error.
+  provider_cursor_bin() { echo /bin/false; }
+  provider_cursor_invoke() {
+    printf '%s\n' "${6:-<none>}" >> "$seen"
+    if [ -n "${6:-}" ]; then
+      echo "Cannot use this model: ${6}. Available models: auto" > "$5/stderr.txt"; return 1
+    fi
+    printf '{"result":"{\\"findings\\":[]}"}' > "$5/stdout.json"; : > "$5/stderr.txt"; return 0
+  }
+  : > "$GOBLIN_HOME/prompt"
+  provider_cursor_review "$GOBLIN_HOME/prompt" "$GOBLIN_HOME" "" "$GOBLIN_HOME/out.json" "$raw" || return 1
+  eq "$GOBLIN_CURSOR_DEFAULT_MODEL
+<none>" "$(cat "$seen")" || return 1
+  eq "cursor-auto" "$GOBLIN_P_MODEL" || return 1
+  teardown
+}
 
 test_manual_mode_is_gone() {
   # --manual took OWNER/REPO, OWNER/REPO#N and a URL, and prompted when given
@@ -2056,6 +2368,7 @@ t "state: dedup ledger"                  test_ledger
 t "state: ledger is repo scoped"         test_ledger_is_repo_scoped
 t "state: distinct PR locks coexist"     test_pr_locks_allow_distinct_audits
 t "state: pr lock staleness scales with timeout" test_pr_lock_staleness_scales_with_configured_timeout
+t "pr: release without a lock is safe"   test_pr_lock_release_survives_never_having_locked
 t "state: state lock excludes holders"   test_state_lock_excludes_concurrent_holders
 t "state: shared state writers are locked" test_shared_state_writers_are_locked
 t "state: writer keeps a lock it never held untouched" test_state_lock_writer_does_not_release_a_lock_it_never_held
@@ -2112,6 +2425,21 @@ t "engine: queue is oldest first"        test_engine_queue_is_oldest_first
 t "engine: discovers user PRs globally"  test_user_pr_discovery_across_repos
 t "engine: pr url routing"               test_url_target_routing
 t "engine: manual mode is gone"          test_manual_mode_is_gone
+t "sweep: runs until a pass adds nothing" test_sweep_runs_until_a_pass_finds_nothing_new
+t "sweep: stops when a pass does not post" test_sweep_stops_when_a_pass_does_not_post
+t "sweep: stops on a silent pass"        test_sweep_stops_when_a_pass_reports_no_outcome
+t "sweep: stops on findings already seen" test_sweep_stops_on_findings_it_has_already_seen
+t "sweep: honours the pass cap"          test_sweep_honours_the_pass_cap
+t "sweep: a pass cannot sweep"           test_sweep_pass_cannot_start_its_own_sweep
+t "sweep: handoff does not re-enter"     test_sweep_handoff_does_not_re_enter_itself
+t "sweep: needs an unambiguous target"   test_sweep_needs_an_unambiguous_target
+t "sweep: a dry run never sweeps"        test_plan_never_sweeps
+t "sweep: pass result written on request" test_pass_result_is_written_only_when_asked
+t "sweep: no fixed-replies on same commit" test_no_fixed_replies_without_a_new_commit
+t "cursor: default model is grok 4.6"    test_cursor_defaults_to_the_named_grok
+t "cursor: changed default is migrated"  test_changed_default_reaches_an_existing_install
+t "config: maxReviewsPerDay default is migrated" test_max_reviews_per_day_default_reaches_an_existing_install
+t "cursor: unknown model falls back"     test_cursor_falls_back_when_the_cli_rejects_the_model
 t "engine: attempt keys are repo scoped" test_attempt_keys_are_repo_scoped
 t "engine: attempt_blocked reads legacy key" test_attempt_blocked_reads_the_legacy_key_too
 t "engine: exact audits isolate checkout" test_exact_audits_use_isolated_checkouts

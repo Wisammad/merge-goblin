@@ -122,14 +122,22 @@ lock_release() { rmdir "${1:-$LOCKDIR}" 2>/dev/null || true; }
 # review can legitimately run close to 4 hours, which a fixed 3h staleness
 # window would treat as abandoned and hand to a second, concurrent audit —
 # the exact duplicate-review-and-post this lock exists to prevent.
+#
+# Initialised here, and read with a default below, because pr_lock_release runs
+# from the engine's EXIT trap — including on the paths that return before any PR
+# lock was taken (a failed auth check, a closed gate). Under `set -u` an unset
+# PR_LOCKDIR aborts the trap *mid-list*, so the reservation_release and
+# lock_release that follow it never run: the safety net silently stops catching.
+PR_LOCKDIR=""
 pr_lock_acquire() {
   local dir="$PR_LOCKS_DIR/$(goblin_hash "$1#$2")"
   lock_acquire "$dir" "$(( $(goblin_max_review_secs) / 60 ))" || return 1
   PR_LOCKDIR="$dir"
 }
 pr_lock_release() {
-  [ -n "$PR_LOCKDIR" ] && lock_release "$PR_LOCKDIR"
+  [ -n "${PR_LOCKDIR:-}" ] && lock_release "$PR_LOCKDIR"
   PR_LOCKDIR=""
+  return 0
 }
 
 # Stable short hash of a string (used for finding ids and fleet assignment).

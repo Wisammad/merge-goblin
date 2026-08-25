@@ -94,7 +94,9 @@ goblin run --plan              # dry run: show exactly what would be posted, pos
 goblin run --pr 123            # review one PR right now
 goblin --auto                  # watch your open PRs everywhere; review each new head
 goblin --auto owner/name       # same watcher, limited to one repo
-goblin https://github.com/owner/name/pull/123  # review that PR immediately
+goblin https://github.com/owner/name/pull/123  # review that PR until a pass finds nothing new
+goblin https://github.com/owner/name/pull/123 --once   # ...or just once
+goblin run --pr 123 --repo owner/name --until-clean    # the same sweep, without a link
 goblin run --repo owner/name --force           # review every open PR in one repo, now
 goblin doctor                  # diagnose anything odd (--fix repairs the safe stuff)
 
@@ -122,6 +124,31 @@ To review one PR right now, paste its GitHub URL straight after `goblin` — the
 from your browser's address bar, tracking parameters and `#files` anchor included. It
 runs immediately, regardless of the automatic scope. For a whole repository at once,
 `goblin run --repo owner/name --force`.
+
+### The sweep
+
+A pasted link does not review once — it **keeps reviewing until a pass finds nothing
+new**. Each pass reads the findings already on the PR, tells the reviewers not to raise
+them again, and posts only what is new, so the passes converge: the pass that adds
+nothing is the pass that says the PR is clean. It is the manual "run it again to see
+what else is in there" loop, automated.
+
+It stops on the first of:
+
+- a pass that raises no finding the sweep has not already seen — **clean**
+- a pass that fails, or that is refused by the daily review cap or the spend cap
+- the PR merging or closing underneath it
+- `maxPassesPerPr` passes (default **5**)
+
+Every pass is a real review, so it spends a `maxReviewsPerDay` slot and, on a metered
+provider, real money. Tune or turn it off:
+
+```bash
+goblin config set .maxPassesPerPr 8      # allow more passes per sweep
+goblin config set .sweepUntilClean false # a pasted link reviews once again
+goblin <PR_URL> --once                   # just this once
+goblin run --pr 123 --repo o/n --until-clean --max-passes 3
+```
 
 Exact-PR audits can run concurrently in separate terminals. Different PRs use isolated
 temporary checkouts; a second audit of the same PR is skipped to prevent duplicate reviews.
@@ -203,12 +230,15 @@ he also caps **reviews per run**. Everything is visible in the panel and `goblin
 | key | default | |
 |---|---|---|
 | `provider` | `claude` | `claude` · `codex` · `cursor` |
+| `providers.cursor.model` | `cursor-grok-4.6-high` | any id `cursor-agent models` lists; blank lets the CLI pick |
 | `providerFallback` | `[]` | try these if the main one is out of quota |
 | `verdictMode` | `comment` | `comment` · `request-changes` · `full` |
 | `allowApprove` | `false` | second opt-in required before he can ever approve |
 | `budgetCapUsd` | `10` | 0 = unlimited |
 | `maxReviewsPerRun` | `5` | |
 | `maxFindings` | `25` | |
+| `sweepUntilClean` | `true` | a pasted PR link re-reviews until a pass finds nothing new |
+| `maxPassesPerPr` | `5` | ceiling on those passes; each one is a real review |
 | `fleet` | `[]` | teammates also running the Goblin |
 | `intervalSeconds` | `300` | re-run `install.sh` after changing |
 

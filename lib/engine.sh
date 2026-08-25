@@ -19,6 +19,7 @@
 . "$LIB_DIR/inbox.sh"
 
 ONLY_PR=""; ONLY_REPO=""; AUTHOR_SCOPE=""; DRY_RUN=false; FORCE=false; SCHEDULED=false
+UNTIL_CLEAN=false; MAX_PASSES=""
 REVIEWS_THIS_RUN=0
 RUN_LOCK_HELD=false
 ACTIVE_CHECKOUT=""
@@ -32,9 +33,33 @@ cmd_run() {
       --plan|--dry-run) DRY_RUN=true; shift ;;
       --force)     FORCE=true; shift ;;
       --scheduled) SCHEDULED=true; shift ;;
+      --until-clean) UNTIL_CLEAN=true; shift ;;
+      --once)      UNTIL_CLEAN=false; shift ;;
+      --max-passes)
+        case "$2" in
+          ''|*[!0-9]*|0) echo "goblin run: --max-passes wants a positive number, got '$2'" >&2; return 2 ;;
+        esac
+        MAX_PASSES="$2"; shift 2 ;;
       *) echo "goblin run: unknown option $1" >&2; return 2 ;;
     esac
   done
+
+  # A dry run posts nothing, so pass 2 would read the same PR pass 1 read and
+  # find the same things forever. Say so rather than quietly doing real reviews
+  # (a sweep pass never carries --plan) or quietly looping on nothing.
+  if [ "$UNTIL_CLEAN" = true ] && [ "$DRY_RUN" = true ]; then
+    echo "$GOBLIN_SLUG run: --plan posts nothing, so there is nothing for a second pass to" >&2
+    echo "  converge on — running a single dry pass." >&2
+    UNTIL_CLEAN=false
+  fi
+
+  # A sweep is a loop OVER runs, not a mode of one, so it is decided before any
+  # of the single-run setup below and delegates each pass to a fresh process.
+  if [ "$UNTIL_CLEAN" = true ]; then
+    cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+    engine_sweep "$ONLY_REPO" "$ONLY_PR" "$MAX_PASSES"
+    return $?
+  fi
 
   cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
   # Only the scheduled path writes to the log file; interactive runs print.
@@ -143,6 +168,139 @@ cmd_auto() {
   return "$rc"
 }
 
+# --- sweep: one PR, reviewed until a pass finds nothing new ----------------
+#
+# One paste of a PR link used to be one review, and a second problem hiding
+# behind the first stayed hidden until somebody ran the command again by hand.
+# That manual restart worked for a reason worth automating: every pass reads the
+# findings already posted on this PR (gh_prior_findings), tells the model not to
+# raise them again, and posts only what is new. The passes therefore converge —
+# the pass that adds nothing is the pass that says the PR is clean.
+#
+# "New" is decided from the finding IDS this sweep has already seen, not from a
+# per-pass count. GitHub's own dedupe cannot close the loop on its own: it works
+# off the inline comments on the PR (gh_prior_findings), and a finding on a line
+# outside the diff is never an inline comment — it is demoted into the review
+# body, where the next pass cannot see it, and would be raised again by every
+# pass forever. Tracking ids here is what makes the sweep converge on those too.
+#
+# Bounded on purpose. Each pass is a real review: it spends a maxReviewsPerDay
+# slot and real money on a provider that meters. maxPassesPerPr is the ceiling,
+# and the loop stops well short of it on any outcome that is not "posted
+# something new" — a failure, the daily cap, the PR merging underneath it. It
+# never spins on a no-op.
+engine_sweep() {
+  local repo="$1" pr="$2" max="${3:-}"
+  local result seen ids pass=0 outcome="" findings=0 fresh=0 total=0
+
+  [ -n "$pr" ] || { echo "$GOBLIN_SLUG run --until-clean: needs --pr N" >&2; return 2; }
+  if [ -z "$repo" ]; then
+    # One configured repo is not ambiguous. Several are, and guessing which PR
+    # #7 someone means is exactly the kind of guess that reviews the wrong PR.
+    repo="$(cfg_repos_enabled | head -2 | paste -sd' ' -)"
+    case "$repo" in
+      "")    echo "$GOBLIN_SLUG run --until-clean: needs --repo OWNER/NAME" >&2; return 2 ;;
+      *" "*) echo "$GOBLIN_SLUG run --until-clean: needs --repo OWNER/NAME (several repos are configured)" >&2; return 2 ;;
+    esac
+  fi
+
+  # A pass must never start a sweep of its own. engine_sweep_pass exports
+  # GOBLIN_SWEEP for exactly this, so a stray --until-clean reaching a child
+  # costs one review instead of forking reviews without end.
+  #
+  # UNTIL_CLEAN has to be cleared before handing back to cmd_run, not just here:
+  # it is a global that survives the call, so cmd_run would parse these three
+  # arguments, still see it set, and come straight back into this function.
+  if [ -n "${GOBLIN_SWEEP:-}" ]; then
+    log "already inside a sweep — reviewing once"
+    UNTIL_CLEAN=false
+    cmd_run --repo "$repo" --pr "$pr" --force
+    return $?
+  fi
+
+  [ -n "$max" ] || max="$(cfg_get '.maxPassesPerPr' 5)"
+  case "$max" in ''|*[!0-9]*) max=5 ;; esac
+  [ "$max" -lt 1 ] && max=1
+
+  result="$RUNTMP/sweep-$$.json"
+  seen="$RUNTMP/sweep-seen-$$.json"; echo '[]' > "$seen"
+  log "sweeping $repo#$pr until a pass finds nothing new (at most $max pass(es))"
+
+  while [ "$pass" -lt "$max" ]; do
+    pass=$((pass + 1))
+    rm -f "$result" 2>/dev/null
+    log "--- pass $pass/$max ---"
+    engine_sweep_pass "$repo" "$pr" "$result" || true
+
+    # An absent or unreadable result means the pass never reached a decision it
+    # could report: it was gated, it crashed, or someone interrupted it. There
+    # is nothing to converge on either way, so stop rather than pay for another.
+    outcome="$(jq -r '.outcome // ""' "$result" 2>/dev/null)"
+    findings="$(jq -r '.findings // 0' "$result" 2>/dev/null)"
+    case "$findings" in ''|*[!0-9]*) findings=0 ;; esac
+
+    if [ "$outcome" != "posted" ]; then
+      log "sweep stopped after pass $pass: ${outcome:-the pass reported no outcome}"
+      break
+    fi
+
+    ids="$(jq -c '(.ids // []) | map(select(. != null))' "$result" 2>/dev/null)"
+    printf '%s' "$ids" | jq -e 'type == "array"' >/dev/null 2>&1 || ids='[]'
+    fresh="$(jq -n --argjson ids "$ids" --slurpfile seen "$seen" \
+      '($ids - $seen[0]) | unique | length' 2>/dev/null)"
+    case "$fresh" in ''|*[!0-9]*) fresh=0 ;; esac
+    jq -n --argjson ids "$ids" --slurpfile seen "$seen" '($seen[0] + $ids) | unique' \
+      > "$seen.t" 2>/dev/null && mv "$seen.t" "$seen"
+
+    if [ "$fresh" -eq 0 ]; then
+      if [ "$findings" -eq 0 ]; then
+        log "pass $pass found nothing — $repo#$pr is clean after $pass pass(es), $total finding(s) posted"
+      else
+        log "pass $pass raised nothing this sweep had not already seen — done after $pass pass(es), $total finding(s) posted"
+      fi
+      rm -f "$result" "$seen" 2>/dev/null
+      return 0
+    fi
+    total=$((total + fresh))
+    log "pass $pass posted $fresh new finding(s) — going again"
+  done
+
+  rm -f "$result" "$seen" 2>/dev/null
+  if [ "$outcome" != "posted" ]; then return 1; fi
+  log "sweep hit its $max-pass cap and pass $max was still finding things ($total posted)"
+  log "run it again, or raise maxPassesPerPr: $GOBLIN_SLUG config set .maxPassesPerPr $((max + 3))"
+  return 1
+}
+
+# engine_sweep_pass <repo> <pr> <result-file>
+#
+# One pass, in a FRESH process — the same delegation cmd_auto uses for its
+# cycles, for the same reasons. Looping in-process would carry pass 1's
+# REVIEWS_THIS_RUN, EXIT trap, claim and quota reservation into pass 2:
+# maxReviewsPerRun (5) alone would have silently capped every sweep, and the
+# cleanup trap would fire once at the very end instead of after each pass.
+engine_sweep_pass() {
+  GOBLIN_SWEEP=1 GOBLIN_PASS_RESULT="$3" \
+    "$GOBLIN_APP/bin/$GOBLIN_SLUG" run --repo "$1" --pr "$2" --force
+}
+
+# engine_pass_write <outcome> [findings] [head] [ids-json] — how this run ended,
+# for the sweep loop that spawned it. A no-op when nobody asked, so no other
+# caller has to know the mechanism exists.
+#
+# Written only where a run reaches a decision. Every other exit leaves the file
+# absent, and engine_sweep reads absence as "stop" — the loop continues on an
+# explicit `posted` carrying a finding id it has not seen, and on nothing else,
+# so a path nobody instrumented can cost a sweep its remaining passes but can
+# never make it spin.
+engine_pass_write() {
+  [ -n "${GOBLIN_PASS_RESULT:-}" ] || return 0
+  local ids="${4:-[]}"
+  printf '%s' "$ids" | jq -e 'type == "array"' >/dev/null 2>&1 || ids='[]'
+  jq -nc --arg o "$1" --argjson f "${2:-0}" --arg h "${3:-}" --argjson ids "$ids" \
+    '{outcome:$o, findings:$f, head:$h, ids:$ids}' > "$GOBLIN_PASS_RESULT" 2>/dev/null || true
+}
+
 # `goblin <PR_URL>` — review exactly the pull request someone pasted.
 #
 # This was one branch of a `--manual` command that also took OWNER/REPO and
@@ -152,7 +310,8 @@ cmd_auto() {
 # link people can paste straight from the browser. Repo-wide and exact-PR runs
 # without a link are `goblin run --repo OWNER/NAME [--pr N] --force`.
 cmd_url() {
-  local url="${1:-}" parsed repo pr
+  local url="${1:-}" parsed repo pr arg once=false
+  shift 2>/dev/null || true
   # GitHub's Files/Commits/Checks tabs put a path segment after the number
   # (.../pull/23/files, .../pull/23/checks?check_run_id=5) — exactly what the
   # address bar holds on those tabs, and a normal thing to paste. `/?` only
@@ -161,9 +320,26 @@ cmd_url() {
     's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(/[^?#]*)?([?#].*)?$|\1/\2 \3|p')"
   [ -n "$parsed" ] || { echo "not a GitHub pull request URL: $url" >&2; return 2; }
   repo="${parsed% *}"; pr="${parsed##* }"
+
+  for arg in "$@"; do
+    case "$arg" in
+      --once) once=true ;;
+      # A dry run posts nothing, so there is no new posted finding for a second
+      # pass to read back and nothing for the loop to converge on. One pass.
+      --plan|--dry-run) once=true ;;
+    esac
+  done
+
+  # A pasted link is someone asking about one specific PR, which is the one case
+  # where reviewing it exhaustively is worth several passes — see engine_sweep.
+  cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+  if [ "$once" != true ] && [ "$(cfg_get '.sweepUntilClean' true)" = "true" ]; then
+    engine_sweep "$repo" "$pr" ""
+    return $?
+  fi
   # --force because pasting a link is a deliberate act: it bypasses the snooze
   # and the configured repo scope exactly as the old --manual did.
-  cmd_run --repo "$repo" --pr "$pr" --force
+  cmd_run --repo "$repo" --pr "$pr" --force "$@"
 }
 
 # --- gates ----------------------------------------------------------------
@@ -217,6 +393,7 @@ engine_budget_ok() {
     if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
       log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
       status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+      engine_pass_write "the daily review cap ($done_today/$max_day) is reached"
       return 1
     fi
   fi
@@ -229,6 +406,7 @@ engine_budget_ok() {
       echo "$today" > "$marker"
     fi
     status_set '{"state":"paused","pausedReason":"budget","activity":""}'
+    engine_pass_write "the \$$cap daily budget is spent (\$$spent)"
     return 1
   fi
   return 0
@@ -420,6 +598,7 @@ engine_pr_unlocked() {
     if ! reservation_try "${slug}#${pr}:$$" "$max_day"; then
       log "  #$pr: hit maxReviewsPerDay ($max_day) — resumes tomorrow"
       status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+      engine_pass_write "the daily review cap ($max_day) is reached"
       return 1
     fi
   fi
@@ -431,6 +610,7 @@ engine_pr_unlocked() {
   if [ "$DRY_RUN" != true ] && ! gh_pr_is_open "$slug" "$pr"; then
     log "  #$pr: already merged or closed, skipping"
     ledger_add "$key"
+    engine_pass_write "the PR is merged or closed"
     return 0
   fi
 
@@ -467,7 +647,9 @@ engine_review_pr() {
 
   # 1. the diff, from GitHub (source of truth for what is commentable)
   if ! diff_fetch_files "$slug" "$pr" "$work/files.json"; then
-    log "  #$pr: no files returned"; rm -rf "$work"; return 1
+    log "  #$pr: no files returned"
+    engine_pass_write "GitHub returned no changed files"
+    rm -rf "$work"; return 1
   fi
   diff_addressable "$work/files.json" "$work/addr.json"
   diff_annotated  "$work/files.json" "$work/diff.txt" "$(cfg_get '.maxDiffBytes' 400000)"
@@ -532,6 +714,7 @@ engine_review_pr() {
     gh_status "$slug" "$head" error "review failed: $kind"
     attempt_record "${slug}#${pr}:${head}" "$kind"
     status_set '{"state":"idle","activity":""}'
+    engine_pass_write "the review itself failed${errors:+ ($errors)}" 0 "$head"
     [ "$isolated_checkout" = true ] && engine_checkout_release
     rm -rf "$work"; return 1
   fi
@@ -543,7 +726,7 @@ engine_review_pr() {
       "$work/norm.json" > "$work/norm2.json" 2>/dev/null && mv "$work/norm2.json" "$work/norm.json"
   fi
 
-  engine_publish "$work" "$slug" "$pr" "$head" "$base" "$title" "$url" "$provider" "$prior_json"
+  engine_publish "$work" "$slug" "$pr" "$head" "$base" "$title" "$url" "$provider" "$prior_json" "$last_sha"
   local rc=$?
   [ "$isolated_checkout" = true ] && engine_checkout_release
   rm -rf "$work"
@@ -552,6 +735,7 @@ engine_review_pr() {
 
 engine_publish() {
   local work="$1" slug="$2" pr="$3" head="$4" base="$5" title="$6" url="$7" provider="$8" prior_json="$9"
+  local last_sha="${10:-}"
   local plan="$work/review-plan-final.json" model cost
   provider="$(jq -r '[.reviewers[].provider] | join("+")' "$plan" 2>/dev/null)"
   model="$(jq -r '[.reviewers[] | (.provider + "/" + (.model // .provider))] | join(" + ")' "$plan" 2>/dev/null)"
@@ -573,6 +757,7 @@ engine_publish() {
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — review payload was incomplete"
     gh_status "$slug" "$head" error "review payload was incomplete"
     attempt_record "${slug}#${pr}:${head}" "payload"
+    engine_pass_write "the review payload was incomplete" 0 "$head"
     return 1
   fi
 
@@ -582,6 +767,7 @@ engine_publish() {
     log "  #$pr: merged or closed during the review — not posting"
     ledger_add "${slug}#${pr}:${head}"
     status_set '{"state":"idle","activity":""}'
+    engine_pass_write "the PR merged or closed during the review" 0 "$head"
     return 0
   fi
 
@@ -595,6 +781,7 @@ engine_publish() {
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — could not post review"
     gh_status "$slug" "$head" error "could not post review"
     attempt_record "${slug}#${pr}:${head}" "post"
+    engine_pass_write "the review could not be posted" 0 "$head"
     return 1
   fi
 
@@ -606,7 +793,14 @@ engine_publish() {
   fi
 
   # tell prior threads that their finding is gone
-  if [ -s "$prior_json" ] && [ "$(jq 'length' "$prior_json")" != "0" ]; then
+  #
+  # "Gone" is only meaningful if the code MOVED. A re-review of the SAME commit —
+  # which every --force re-run is, and every sweep pass after the first —
+  # deliberately drops the findings already posted before it reaches here, so
+  # each of those threads looks resolved and would be told "no longer flagged"
+  # about a bug still sitting on that exact line. No new commit, nothing fixed.
+  if [ -s "$prior_json" ] && [ "$(jq 'length' "$prior_json")" != "0" ] \
+     && [ "$last_sha" != "$head" ]; then
     jq -c '[.findings[].id]' "$work/norm.json" > "$work/curids.json"
     post_fixed_replies "$slug" "$pr" "$prior_json" "$work/curids.json" "$head"
   fi
@@ -618,6 +812,14 @@ engine_publish() {
 
   ledger_add "${slug}#${pr}:${head}"
   attempt_clear "${slug}#${pr}:${head}"
+  # What a sweep converges on: the findings NEW in this review, after the ones
+  # already posted on the PR were dropped above. The ids matter more than the
+  # count — the sweep ends when a pass carries no id it has not already seen,
+  # which is the only way a finding GitHub never anchored inline stops being
+  # re-raised forever.
+  engine_pass_write posted \
+    "$(jq '.findings | length' "$work/norm.json" 2>/dev/null || echo 0)" "$head" \
+    "$(jq -c '[.findings[].id]' "$work/norm.json" 2>/dev/null || echo '[]')"
   events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"
   # The moment the posted event exists, today_review_count sees it — holding
   # the reservation any longer double-counts this same review as both
