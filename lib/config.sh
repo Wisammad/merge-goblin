@@ -43,6 +43,7 @@ goblin_default_config() {
   "skipIfHumanReviewed": true,
   "sweepUntilClean": true,
   "maxPassesPerPr": 5,
+  "fanoutWorkers": 3,
   "setupComplete": false,
   "cache": { "reposTtlSecs": 3600 }
 }

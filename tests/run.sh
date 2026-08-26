@@ -51,6 +51,7 @@ test_config_defaults() {
   eq "true"    "$(cfg_get '.enabled' x)"        || return 1
   eq "comment" "$(cfg_get '.verdictMode' x)"    || return 1
   eq "4"       "$(cfg_get '.schemaVersion' x)"  || return 1
+  eq "3"       "$(cfg_get '.fanoutWorkers' x)"  || return 1
   eq "fallback" "$(cfg_get '.nope.missing' fallback)" || return 1
   teardown
 }
@@ -1405,11 +1406,114 @@ test_url_target_routing() (
   : > "$calls"
   cmd_url 'https://github.com/acme/ten/pull/4' --once || return 1
   eq "--repo acme/ten --pr 4 --force --once" "$(cat "$calls")" || return 1
+  # The repo's /pulls page is every open PR, fanned out, not a bad /pull/N.
+  : > "$calls"
+  engine_fanout() { printf 'fanout %s %s\n' "$1" "${2:-def}" >> "$calls"; }
+  cfg_set '.sweepUntilClean = true'
+  cmd_url 'https://github.com/acme/nine/pulls' || return 1
+  cmd_url 'https://github.com/acme/nine/pulls/' || return 1
+  cmd_url 'https://github.com/acme/nine/pulls?q=is%3Aopen' || return 1
+  eq "fanout acme/nine def
+fanout acme/nine def
+fanout acme/nine def" "$(cat "$calls")" || return 1
+  : > "$calls"
+  cmd_url 'https://github.com/acme/nine/pulls' --once || return 1
+  eq "fanout acme/nine 1" "$(cat "$calls")" || return 1
   # Anything that is not a PR link is refused rather than half-parsed.
   cmd_url 'https://github.com/acme/four/issues/19' >/dev/null 2>&1 && return 1
   cmd_url 'acme/four#19'  >/dev/null 2>&1 && return 1
   cmd_url 'bad-target'    >/dev/null 2>&1 && return 1
   cmd_url ''              >/dev/null 2>&1 && return 1
+  teardown
+)
+
+# ----------------------------------------------------------------- fanout ---
+# Shared canned `gh pr list` for fanout tests: four open PRs plus a draft.
+# Oldest first is 1,2,4,5 — 3 is the draft and must never be swept.
+fanout_prs_fixture() {
+  cat > "$GOBLIN_HOME/prs.json" <<'JSON'
+[
+  {"number":4,"headRefOid":"d","isDraft":false,"title":"four","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-04T00:00:00Z","createdAt":"2026-01-04T00:00:00Z"},
+  {"number":1,"headRefOid":"a","isDraft":false,"title":"one","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-01T00:00:00Z","createdAt":"2026-01-01T00:00:00Z"},
+  {"number":3,"headRefOid":"c","isDraft":true,"title":"draft","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-03T00:00:00Z","createdAt":"2026-01-03T00:00:00Z"},
+  {"number":2,"headRefOid":"b","isDraft":false,"title":"two","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-02T00:00:00Z","createdAt":"2026-01-02T00:00:00Z"},
+  {"number":5,"headRefOid":"e","isDraft":false,"title":"five","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-05T00:00:00Z","createdAt":"2026-01-05T00:00:00Z"}
+]
+JSON
+  export GH_FAKE_PRS="$GOBLIN_HOME/prs.json"
+}
+
+test_fanout_assigns_each_open_pr_once() (
+  setup
+  goblin_ensure_dirs
+  . "$ROOT/lib/engine.sh"
+  fanout_prs_fixture
+  engine_sweep() { printf '%s\n' "$2" > "$GOBLIN_HOME/swept-$2"; }
+  cfg_set '.fanoutWorkers = 3'
+  engine_fanout acme/repo 1 >/dev/null || return 1
+  eq "1 2 4 5" "$(ls "$GOBLIN_HOME"/swept-* 2>/dev/null | sed 's/.*swept-//' | sort | paste -sd' ' -)" \
+    || return 1
+  [ -f "$GOBLIN_HOME/swept-3" ] && { echo "a draft was swept"; return 1; }
+  teardown
+)
+
+test_fanout_skips_a_pr_another_goblin_holds() (
+  setup
+  goblin_ensure_dirs
+  . "$ROOT/lib/engine.sh"
+  fanout_prs_fixture
+  engine_sweep() { printf '%s\n' "$2" > "$GOBLIN_HOME/swept-$2"; }
+  cfg_set '.fanoutWorkers = 3'
+  pr_lock_acquire acme/repo 2 || return 1
+  engine_fanout acme/repo 1 >/dev/null || return 1
+  eq "1 4 5" "$(ls "$GOBLIN_HOME"/swept-* 2>/dev/null | sed 's/.*swept-//' | sort | paste -sd' ' -)" \
+    || return 1
+  [ -f "$GOBLIN_HOME/swept-2" ] && { echo "a locked PR was swept anyway"; return 1; }
+  pr_lock_release
+  teardown
+)
+
+test_fanout_caps_workers_to_the_pr_count() (
+  setup
+  goblin_ensure_dirs
+  . "$ROOT/lib/engine.sh"
+  # Two open PRs, config asks for 5 workers — spawn two, not five.
+  cat > "$GOBLIN_HOME/prs.json" <<'JSON'
+[
+  {"number":1,"headRefOid":"a","isDraft":false,"title":"one","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-01T00:00:00Z","createdAt":"2026-01-01T00:00:00Z"},
+  {"number":2,"headRefOid":"b","isDraft":false,"title":"two","url":"u","baseRefName":"main","author":{"login":"me"},"reviewRequests":[],"updatedAt":"2026-01-02T00:00:00Z","createdAt":"2026-01-02T00:00:00Z"}
+]
+JSON
+  export GH_FAKE_PRS="$GOBLIN_HOME/prs.json"
+  engine_sweep() { :; }
+  cfg_set '.fanoutWorkers = 5'
+  local out
+  out="$(engine_fanout acme/repo 1 2>&1)" || return 1
+  printf '%s\n' "$out" | grep -q '2 worker(s) in parallel' \
+    || { echo "workers were not capped to the PR count:"; printf '%s\n' "$out"; return 1; }
+  teardown
+)
+
+test_until_clean_without_pr_fans_out() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_fanout() { printf 'fanout %s %s\n' "$1" "${2:-def}" > "$GOBLIN_HOME/calls"; }
+  engine_sweep() { echo "swept $2" >> "$GOBLIN_HOME/calls"; }
+  cmd_run --repo acme/repo --until-clean >/dev/null || return 1
+  eq "fanout acme/repo def" "$(cat "$GOBLIN_HOME/calls")" || return 1
+  teardown
+)
+
+test_fanout_dequeue_is_exclusive() (
+  setup
+  goblin_ensure_dirs
+  . "$ROOT/lib/engine.sh"
+  local q="$GOBLIN_HOME/q.txt"
+  printf '1\n2\n3\n' > "$q"
+  eq "1" "$(fanout_dequeue "$q")" || return 1
+  eq "2" "$(fanout_dequeue "$q")" || return 1
+  eq "3" "$(fanout_dequeue "$q")" || return 1
+  eq ""  "$(fanout_dequeue "$q")" || return 1
   teardown
 )
 
@@ -1706,8 +1810,10 @@ test_manual_mode_is_gone() {
     && { echo "cmd_manual is still referenced"; return 1; }
   grep -q -- '--manual' "$ROOT/bin/goblin" "$ROOT/README.md" \
     && { echo "--manual is still advertised"; return 1; }
-  # The URL branch still has something to call.
+  # The URL branch still has something to call, including the repo /pulls list.
   grep -q 'cmd_url "$cmd"' "$ROOT/bin/goblin" || { echo "url dispatch is broken"; return 1; }
+  grep -q 'github.com/\*/pulls' "$ROOT/bin/goblin" \
+    || { echo "/pulls is not dispatched to cmd_url"; return 1; }
   return 0
 }
 
@@ -2424,6 +2530,11 @@ t "prompt: strips bot chrome from body"  test_prompt_strips_bot_chrome_from_pr_b
 t "engine: queue is oldest first"        test_engine_queue_is_oldest_first
 t "engine: discovers user PRs globally"  test_user_pr_discovery_across_repos
 t "engine: pr url routing"               test_url_target_routing
+t "fanout: each open PR swept once"      test_fanout_assigns_each_open_pr_once
+t "fanout: skips a PR another goblin holds" test_fanout_skips_a_pr_another_goblin_holds
+t "fanout: workers capped to PR count"   test_fanout_caps_workers_to_the_pr_count
+t "fanout: until-clean without --pr"     test_until_clean_without_pr_fans_out
+t "fanout: dequeue is exclusive"         test_fanout_dequeue_is_exclusive
 t "engine: manual mode is gone"          test_manual_mode_is_gone
 t "sweep: runs until a pass adds nothing" test_sweep_runs_until_a_pass_finds_nothing_new
 t "sweep: stops when a pass does not post" test_sweep_stops_when_a_pass_does_not_post

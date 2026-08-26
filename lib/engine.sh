@@ -23,6 +23,7 @@ UNTIL_CLEAN=false; MAX_PASSES=""
 REVIEWS_THIS_RUN=0
 RUN_LOCK_HELD=false
 ACTIVE_CHECKOUT=""
+FANOUT_PIDS=""
 
 cmd_run() {
   while [ $# -gt 0 ]; do
@@ -55,9 +56,14 @@ cmd_run() {
 
   # A sweep is a loop OVER runs, not a mode of one, so it is decided before any
   # of the single-run setup below and delegates each pass to a fresh process.
+  # No --pr means every open PR in the repo, fanned out across fanoutWorkers.
   if [ "$UNTIL_CLEAN" = true ]; then
     cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
-    engine_sweep "$ONLY_REPO" "$ONLY_PR" "$MAX_PASSES"
+    if [ -z "$ONLY_PR" ]; then
+      engine_fanout "$ONLY_REPO" "$MAX_PASSES"
+    else
+      engine_sweep "$ONLY_REPO" "$ONLY_PR" "$MAX_PASSES"
+    fi
     return $?
   fi
 
@@ -280,7 +286,7 @@ engine_sweep() {
 # maxReviewsPerRun (5) alone would have silently capped every sweep, and the
 # cleanup trap would fire once at the very end instead of after each pass.
 engine_sweep_pass() {
-  GOBLIN_SWEEP=1 GOBLIN_PASS_RESULT="$3" \
+  GOBLIN_SWEEP=1 GOBLIN_PASS_RESULT="$3" GOBLIN_FANOUT="${GOBLIN_FANOUT:-}" \
     "$GOBLIN_APP/bin/$GOBLIN_SLUG" run --repo "$1" --pr "$2" --force
 }
 
@@ -301,7 +307,123 @@ engine_pass_write() {
     '{outcome:$o, findings:$f, head:$h, ids:$ids}' > "$GOBLIN_PASS_RESULT" 2>/dev/null || true
 }
 
+# --- fanout: every open PR, N workers, each sweeping until clean -----------
+#
+# Pasting the repo's /pulls page is "audit everything", not "audit the one PR
+# in the address bar". One worker per PR would serialize a backlog; one
+# process for the whole list already exists (`goblin run --repo`) and cannot
+# overlap. fanoutWorkers (default 3) background workers pull from a shared
+# queue: each one sweeps a PR up to maxPassesPerPr, then takes the next PR
+# that no other worker — and no other Goblin on this machine — is holding.
+#
+# The parent keeps the global run lock so a scheduled cycle does not start
+# a second scan underneath this. The workers themselves are exact-PR sweeps,
+# so they skip that lock and only contend on per-PR locks + git-ref claims.
+engine_fanout() {
+  local repo="$1" max="${2:-}"
+  local prs queue workers n i pid rc=0
+
+  if [ -z "$repo" ]; then
+    repo="$(cfg_repos_enabled | head -2 | paste -sd' ' -)"
+    case "$repo" in
+      "")    echo "$GOBLIN_SLUG run --until-clean: needs --repo OWNER/NAME" >&2; return 2 ;;
+      *" "*) echo "$GOBLIN_SLUG run --until-clean: needs --repo OWNER/NAME (several repos are configured)" >&2; return 2 ;;
+    esac
+  fi
+
+  [ -n "$max" ] || max="$(cfg_get '.maxPassesPerPr' 5)"
+  case "$max" in ''|*[!0-9]*) max=5 ;; esac
+  [ "$max" -lt 1 ] && max=1
+
+  workers="$(cfg_get '.fanoutWorkers' 3)"
+  case "$workers" in ''|*[!0-9]*) workers=3 ;; esac
+  [ "$workers" -lt 1 ] && workers=1
+  [ "$workers" -gt 8 ] && workers=8
+
+  if ! lock_acquire; then log "another run is active, exiting"; return 0; fi
+  RUN_LOCK_HELD=true
+  trap 'engine_fanout_stop; engine_run_lock_release; exit 130' INT TERM
+
+  goblin_ensure_dirs
+  prs="$RUNTMP/fanout-prs-$$.json"
+  queue="$RUNTMP/fanout-queue-$$.txt"
+  gh_prs "$repo" "$prs" || {
+    log "$repo: could not list PRs (no access?)"
+    engine_run_lock_release
+    trap - INT TERM
+    return 1
+  }
+  jq -r 'sort_by(.createdAt // 0) | .[] | select(.draft != true) | (.number | tostring)' \
+    "$prs" > "$queue" 2>/dev/null
+  n="$(wc -l < "$queue" 2>/dev/null | tr -d ' ')"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 0 ] && [ "$workers" -gt "$n" ] && workers="$n"
+
+  log "fanout $repo: $n open PR(s), $workers worker(s) in parallel, $max pass(es) each"
+
+  if [ "$n" -eq 0 ]; then
+    rm -f "$prs" "$queue" 2>/dev/null
+    engine_run_lock_release
+    trap - INT TERM
+    return 0
+  fi
+
+  FANOUT_PIDS=""
+  i=1
+  while [ "$i" -le "$workers" ]; do
+    engine_fanout_worker "$repo" "$queue" "$max" "$i" &
+    FANOUT_PIDS="$FANOUT_PIDS $!"
+    i=$((i + 1))
+  done
+  for pid in $FANOUT_PIDS; do
+    wait "$pid" || rc=1
+  done
+  FANOUT_PIDS=""
+  rm -f "$prs" "$queue" 2>/dev/null
+  engine_run_lock_release
+  trap - INT TERM
+  log "fanout $repo: done"
+  return "$rc"
+}
+
+engine_fanout_stop() {
+  local pid
+  for pid in ${FANOUT_PIDS:-}; do
+    kill "$pid" 2>/dev/null || true
+  done
+  FANOUT_PIDS=""
+}
+
+# fanout_dequeue <queue-file> — atomically pop the next PR number. Empty → "".
+fanout_dequeue() {
+  local queue="$1" pr="" locked=false
+  goblin_state_lock fanout-queue && locked=true
+  if [ -s "$queue" ]; then
+    pr="$(head -1 "$queue" | tr -d '\r\n')"
+    tail -n +2 "$queue" > "$queue.t" 2>/dev/null && mv "$queue.t" "$queue"
+  fi
+  [ "$locked" = true ] && goblin_state_unlock fanout-queue
+  printf '%s' "$pr"
+}
+
+engine_fanout_worker() {
+  local repo="$1" queue="$2" max="$3" id="$4" pr
+  while :; do
+    pr="$(fanout_dequeue "$queue")"
+    [ -n "$pr" ] || break
+    if pr_lock_busy "$repo" "$pr"; then
+      log "fanout $id: #$pr is already being reviewed, skipping"
+      continue
+    fi
+    log "fanout $id: taking $repo#$pr"
+    GOBLIN_FANOUT=1 engine_sweep "$repo" "$pr" "$max" || true
+    log "fanout $id: finished $repo#$pr"
+  done
+  log "fanout $id: queue empty, stopping"
+}
+
 # `goblin <PR_URL>` — review exactly the pull request someone pasted.
+# `goblin <repo>/pulls` — fan the same sweep out across every open PR.
 #
 # This was one branch of a `--manual` command that also took OWNER/REPO and
 # OWNER/REPO#N, and prompted for a target when given neither. All of it ended in
@@ -312,13 +434,41 @@ engine_pass_write() {
 cmd_url() {
   local url="${1:-}" parsed repo pr arg once=false
   shift 2>/dev/null || true
+
+  # The repo's pull-request list (`.../pulls`, query string included) is "every
+  # open PR", not a single review. Parsed first so `/pulls` cannot be mistaken
+  # for a malformed `/pull/N`.
+  parsed="$(printf '%s' "$url" | sed -nE \
+    's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pulls/?([?#].*)?$|\1/\2|p')"
+  if [ -n "$parsed" ]; then
+    repo="$parsed"
+    for arg in "$@"; do
+      case "$arg" in
+        --once) once=true ;;
+        --plan|--dry-run)
+          # A dry run posts nothing, so there is nothing for a sweep to converge
+          # on and nothing for three workers to overlap. One sequential preview.
+          cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+          cmd_run --repo "$repo" --force "$@"
+          return $? ;;
+      esac
+    done
+    cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+    if [ "$once" = true ] || [ "$(cfg_get '.sweepUntilClean' true)" != "true" ]; then
+      engine_fanout "$repo" 1
+    else
+      engine_fanout "$repo" ""
+    fi
+    return $?
+  fi
+
   # GitHub's Files/Commits/Checks tabs put a path segment after the number
   # (.../pull/23/files, .../pull/23/checks?check_run_id=5) — exactly what the
   # address bar holds on those tabs, and a normal thing to paste. `/?` only
   # tolerated a single bare trailing slash, so those pastes were rejected.
   parsed="$(printf '%s' "$url" | sed -nE \
     's|^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/([1-9][0-9]*)(/[^?#]*)?([?#].*)?$|\1/\2 \3|p')"
-  [ -n "$parsed" ] || { echo "not a GitHub pull request URL: $url" >&2; return 2; }
+  [ -n "$parsed" ] || { echo "not a GitHub pull request or pulls URL: $url" >&2; return 2; }
   repo="${parsed% *}"; pr="${parsed##* }"
 
   for arg in "$@"; do
@@ -615,7 +765,10 @@ engine_pr_unlocked() {
   fi
 
   # --- gate: atomic claim (authoritative) ---
-  if [ "$DRY_RUN" != true ] && [ -z "$ONLY_PR" ]; then
+  # Exact-PR pastes skip this: "review THIS one now" is allowed to overlap a
+  # teammate. Fanout workers must not — they are the same "every open PR" scan
+  # a scheduled run does, just parallel, and GOBLIN_FANOUT marks them.
+  if [ "$DRY_RUN" != true ] && { [ -z "$ONLY_PR" ] || [ -n "${GOBLIN_FANOUT:-}" ]; }; then
     if [ "$(cfg_get '.refsForbidden' false)" = "true" ]; then
       claim_try_comment "$slug" "$pr" "$head" || { log "  #$pr: another bot claimed it"; return 0; }
     else

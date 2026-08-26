@@ -140,6 +140,17 @@ pr_lock_release() {
   return 0
 }
 
+# True when another process on this machine currently holds the PR lock.
+# Does not acquire it — fanout uses this to skip a PR another Goblin (or
+# another local worker) is already auditing, then pick a free one.
+pr_lock_busy() {
+  local dir="$PR_LOCKS_DIR/$(goblin_hash "$1#$2")" stale_mins
+  [ -d "$dir" ] || return 1
+  stale_mins="$(( $(goblin_max_review_secs) / 60 ))"
+  [ -n "$(find "$dir" -maxdepth 0 -mmin +"$stale_mins" 2>/dev/null)" ] && return 1
+  return 0
+}
+
 # Stable short hash of a string (used for finding ids and fleet assignment).
 goblin_hash() { printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-12; }
 

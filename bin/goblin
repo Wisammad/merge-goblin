@@ -12,6 +12,7 @@
 #   goblin run --plan      dry run: show what it would post, post nothing
 #   goblin --auto [repo]   watch your PR heads everywhere, or in one repo
 #   goblin <PR_URL>        review that PR over and over until a pass finds nothing new
+#   goblin <repo>/pulls    same sweep, fanned out across every open PR (3 at a time)
 #   goblin off / on        master switch (survives reboot)
 #
 # See `goblin help` for the full surface.
@@ -59,11 +60,13 @@ $GOBLIN_EMOJI $GOBLIN_NAME v$GOBLIN_VERSION — $GOBLIN_TAGLINE
   goblin doctor [--fix] [--json]      diagnose everything; --fix repairs the safe ones
   goblin run [--pr N] [--repo SLUG]   review now
           [--plan] [--force]       --plan = dry run (posts nothing)
-          [--until-clean]          re-review one PR until a pass finds nothing new
+          [--until-clean]          re-review until a pass finds nothing new
           [--max-passes N]         cap those passes (default: maxPassesPerPr)
+                                   without --pr, fans out across every open PR
   goblin --auto [OWNER/REPO]          watch your open PRs and review each new head
   goblin https://github.com/O/R/pull/N review that PR until a pass finds nothing new
                                       (add --once for a single pass)
+  goblin https://github.com/O/R/pulls  every open PR, 3 at a time, same sweep
   goblin on | off                     master switch (off survives reboot)
   goblin pause | resume | toggle      temporary stop (agent stays scheduled)
   goblin snooze 1h|tomorrow|<secs>|clear
@@ -100,7 +103,7 @@ case "$cmd" in
   update)   . "$LIB_DIR/update.sh";      cmd_update "$@" ;;
   version)  echo "$GOBLIN_NAME $GOBLIN_VERSION" ;;
   help|-h|--help) usage ;;
-  https://github.com/*/pull/*)
+  https://github.com/*/pull/*|https://github.com/*/pulls|https://github.com/*/pulls[/?]*)
             . "$LIB_DIR/engine.sh";      cmd_url "$cmd" "$@" ;;
   # everything else is a small control verb
   on|off|pause|resume|toggle|toggle-power|snooze|budget|repos|provider|fleet|config|log|agent|fix-account|\

@@ -96,8 +96,10 @@ goblin --auto                  # watch your open PRs everywhere; review each new
 goblin --auto owner/name       # same watcher, limited to one repo
 goblin https://github.com/owner/name/pull/123  # review that PR until a pass finds nothing new
 goblin https://github.com/owner/name/pull/123 --once   # ...or just once
+goblin https://github.com/owner/name/pulls     # every open PR, 3 at a time, same sweep
 goblin run --pr 123 --repo owner/name --until-clean    # the same sweep, without a link
-goblin run --repo owner/name --force           # review every open PR in one repo, now
+goblin run --repo owner/name --until-clean     # every open PR in the repo, 3 at a time
+goblin run --repo owner/name --force           # review every open PR in one repo, once each
 goblin doctor                  # diagnose anything odd (--fix repairs the safe stuff)
 
 goblin off / goblin on            # master switch (off survives reboots)
@@ -122,8 +124,10 @@ watch to one repository.
 
 To review one PR right now, paste its GitHub URL straight after `goblin` — the link
 from your browser's address bar, tracking parameters and `#files` anchor included. It
-runs immediately, regardless of the automatic scope. For a whole repository at once,
-`goblin run --repo owner/name --force`.
+runs immediately, regardless of the automatic scope. Paste the repo's `/pulls` page
+to fan that same until-clean sweep across every open PR, three at a time; when a
+worker finishes it takes the next PR nobody else is already reviewing.
+`goblin run --repo owner/name --until-clean` is the same thing without a link.
 
 ### The sweep
 
@@ -140,12 +144,18 @@ It stops on the first of:
 - the PR merging or closing underneath it
 - `maxPassesPerPr` passes (default **5**)
 
+Paste the repo's `/pulls` page (or `goblin run --repo owner/name --until-clean`) and
+the same sweep runs on every open PR, **three at a time**. When a worker finishes a
+PR it takes the next one that another Goblin is not already holding. Tune the width
+with `fanoutWorkers`.
+
 Every pass is a real review, so it spends a `maxReviewsPerDay` slot and, on a metered
 provider, real money. Tune or turn it off:
 
 ```bash
 goblin config set .maxPassesPerPr 8      # allow more passes per sweep
 goblin config set .sweepUntilClean false # a pasted link reviews once again
+goblin config set .fanoutWorkers 3       # parallel workers on a /pulls paste
 goblin <PR_URL> --once                   # just this once
 goblin run --pr 123 --repo o/n --until-clean --max-passes 3
 ```
@@ -235,6 +245,8 @@ he also caps **reviews per run**. Everything is visible in the panel and `goblin
 | `verdictMode` | `comment` | `comment` · `request-changes` · `full` |
 | `allowApprove` | `false` | second opt-in required before he can ever approve |
 | `budgetCapUsd` | `10` | 0 = unlimited |
+| `maxReviewsPerDay` | `30` | pause once this many have posted today; 0 = unlimited |
+| `fanoutWorkers` | `3` | parallel sweeps when pointing at `/pulls` (1–8) |
 | `maxReviewsPerRun` | `5` | |
 | `maxFindings` | `25` | |
 | `sweepUntilClean` | `true` | a pasted PR link re-reviews until a pass finds nothing new |

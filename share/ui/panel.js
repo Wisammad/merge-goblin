@@ -2403,7 +2403,7 @@
         repos: [{ slug: 'mockorg/mock-repo', enabled: true }, { slug: 'mockorg/other', enabled: false }],
         fleet: ['mock-teammate'],
         fleetAssignment: true, verdictMode: 'comment', allowApprove: false,
-        maxReviewsPerDay: 20, maxReviewsPerRun: 5, maxFindings: 25,
+        maxReviewsPerDay: 30, maxReviewsPerRun: 5, maxFindings: 25,
         postCommitStatus: true, incrementalReview: true, skipIfHumanReviewed: true,
         notify: { started: true, posted: true, failed: true, budget: true, sound: false },
       },
