@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# reviewers.sh — detect the coding agent, run independent reviewers in parallel,
+# and merge their normalized findings into one review.
+
+reviewer_label() {
+  case "$1" in claude) printf 'Claude' ;; codex) printf 'OpenAI Codex' ;;
+    cursor) printf 'Cursor' ;; *) printf '%s' "$1" ;; esac
+}
+
+# reviewers_plan <evidence.txt> <out.json>
+#
+# EVERY agent whose signature appears is a contributor, and none of them may
+# review. Keeping only the highest-scoring one routed reviews straight back to a
+# co-author: with Claude and Codex tied at one signature each, `-gt` is strict so
+# Claude won on iteration order alone, and the plan then asked Codex — an actual
+# author of the diff — to review its own work.
+reviewers_plan() {
+  local evidence="$1" out="$2" p pattern n one
+  local contributors="" independent="" best="" best_n=0 signal=""
+  local counts='{}' sigs='[]'
+
+  for p in claude codex cursor; do
+    case "$p" in
+      claude) pattern='co-authored-by:.*(claude|anthropic)|noreply@anthropic\.com|generated (with|by).*claude|claude code' ;;
+      codex)  pattern='co-authored-by:.*(codex|openai)|noreply@openai\.com|generated (with|by).*codex|written by codex' ;;
+      cursor) pattern='co-authored-by:.*cursor|cursor(agent)?@|generated (with|by).*cursor|made with cursor' ;;
+    esac
+    n="$(grep -Eic "$pattern" "$evidence" 2>/dev/null || true)"; n="${n:-0}"
+    counts="$(printf '%s' "$counts" | jq -c --arg p "$p" --argjson n "$n" '. + {($p):$n}')"
+    if [ "$n" -gt 0 ]; then
+      contributors="${contributors:+$contributors }$p"
+      # This line comes straight from the PR title, body, branch name or a
+      # commit message — all author-controlled. render.sh puts it inside a
+      # single backtick code span; a backtick in the text would close that
+      # span early and let the rest render as live Markdown in a comment that
+      # otherwise reads as a trusted, automated review. Stripped here, once,
+      # rather than at every place this field is later rendered.
+      one="$(grep -Ei "$pattern" "$evidence" 2>/dev/null | head -1 | tr -d '\000-\037`' | cut -c 1-180)"
+      sigs="$(printf '%s' "$sigs" | jq -c --arg p "$p" --arg l "$(reviewer_label "$p")" \
+        --argjson n "$n" --arg s "$one" '. + [{provider:$p,label:$l,matches:$n,signal:$s}]')"
+      # `best` is now only the headline for the posted review; exclusion uses the
+      # whole contributor set below.
+      if [ "$n" -gt "$best_n" ]; then best="$p"; best_n="$n"; signal="$one"; fi
+    else
+      independent="${independent:+$independent }$p"
+    fi
+  done
+
+  # Not a contributor is necessary but not sufficient: the plan must also only
+  # pick reviewers actually installed and authenticated here. Planning by
+  # signature alone routed a Claude-only machine straight at "codex cursor" for
+  # a Claude-authored PR — both probes were guaranteed to fail, reviewers_run
+  # returned total failure, and nothing was ever posted even though Claude
+  # itself was sitting there ready to review (with disclosure), same as the
+  # "every agent contributed" fallback below already does.
+  local n_ind_raw=0; for p in $independent; do n_ind_raw=$((n_ind_raw + 1)); done
+  local avail="" probe
+  for p in claude codex cursor; do
+    command -v "provider_${p}_probe" >/dev/null 2>&1 || continue
+    probe="$("provider_${p}_probe" 2>/dev/null)"
+    [ "$(printf '%s' "$probe" | jq -r '.available and .authed' 2>/dev/null)" = true ] \
+      && avail="${avail:+$avail }$p"
+  done
+  local independent_raw="$independent"; independent=""
+  for p in $independent_raw; do
+    case " $avail " in *" $p "*) independent="${independent:+$independent }$p" ;; esac
+  done
+
+  local n_ind=0; for p in $independent; do n_ind=$((n_ind + 1)); done
+
+  local reviewers="" overrides='' note='' is_independent=true fallback
+
+  if [ -z "$contributors" ]; then
+    # Nothing to exclude. Prefer Claude Opus plus the configured companion —
+    # but only when BOTH are actually installed and authed. Hardcoding this
+    # pair regardless of `avail` reintroduced the exact failure the
+    # availability filter above exists to prevent: a machine configured for
+    # cursor that is signed out, with codex actually installed, planned
+    # "claude cursor", both probes failed, and codex was never asked.
+    fallback="$(cfg_get '.provider' 'codex')"
+    [ "$fallback" = claude ] && fallback=codex
+    local pref="claude $fallback" pref_n=0 pp
+    for pp in $pref; do case " $avail " in *" $pp "*) pref_n=$((pref_n + 1)) ;; esac; done
+    if [ "$pref_n" -ge 2 ]; then
+      reviewers="$pref"; overrides='claude=opus'
+    fi
+    # Otherwise fall through to the general, availability-aware logic below —
+    # `independent` already is every available provider here, since nothing
+    # was excluded.
+  fi
+
+  if [ -n "$reviewers" ]; then
+    true  # the preferred pair above was fully available; nothing left to decide
+  elif [ "$n_ind" -ge 2 ]; then
+    # At most two reviewers ever run in parallel. When a contributor was
+    # excluded, `independent` already has at most two members; when nothing
+    # was (the branch above), it can be all three available providers and
+    # must still be capped here.
+    reviewers="$(printf '%s\n' $independent | head -2 | paste -sd' ' -)"
+  elif [ "$n_ind" -eq 1 ]; then
+    reviewers="$independent"
+    note="only $(reviewer_label "$independent") is both independent and available here, so it reviewed alone"
+  else
+    # No candidate is both uninvolved and actually usable — either every agent
+    # contributed, or the ones that didn't are not installed/authed here.
+    # Prefer the least-involved CONTRIBUTOR that IS available; fall back to
+    # least-involved overall only if nothing on this machine is usable at all.
+    reviewers="$(printf '%s' "$counts" | jq -r --arg avail "$avail" '
+      ($avail | split(" ") | map(select(length > 0))) as $av
+      | to_entries
+      | (map(select(.key as $k | $av | index($k)))) as $usable
+      | (if ($usable | length) > 0 then $usable else . end)
+      | sort_by(.value) | .[0].key')"
+    is_independent=false
+    if [ -z "$contributors" ]; then
+      note="no coding-agent signature was detected, and no provider is installed/authenticated here; reviewing with $(reviewer_label "$reviewers") instead"
+    elif [ "$n_ind_raw" -gt 0 ]; then
+      local unavail_labels="" up
+      for up in $independent_raw; do unavail_labels="${unavail_labels:+$unavail_labels, }$(reviewer_label "$up")"; done
+      note="$unavail_labels did not contribute but is not installed/authenticated on this machine; reviewing with $(reviewer_label "$reviewers") instead — not an independent review"
+    else
+      note="every available agent contributed to this PR; $(reviewer_label "$reviewers") had the fewest signatures and is reviewing its own work"
+    fi
+  fi
+
+  local list='[]' override label
+  for p in $reviewers; do
+    override=""
+    [ "$p" = claude ] && [ "$overrides" = 'claude=opus' ] && override=opus
+    label="$(reviewer_label "$p")"
+    [ "$p" = claude ] && [ "$override" = opus ] && label='Claude Opus 5'
+    list="$(printf '%s' "$list" | jq -c --arg p "$p" --arg l "$label" --arg o "$override" \
+      '. + [{provider:$p,label:$l,modelOverride:$o}]')"
+  done
+
+  jq -n --arg p "$best" --arg l "$(reviewer_label "$best")" --arg s "$signal" \
+    --argjson n "$best_n" --argjson reviewers "$list" \
+    --argjson contributors "$sigs" --argjson counts "$counts" \
+    --argjson ind "$is_independent" --arg note "$note" \
+    '{contributor:{detected:($p != ""),provider:$p,label:$l,matches:$n,signal:$s},
+      contributors:$contributors, matchCounts:$counts,
+      independent:$ind, note:$note, reviewers:$reviewers}' > "$out"
+}
+
+reviewer_run_one() {
+  local provider="$1" override="$2" prompt="$3" dir="$4" work="$5"
+  local raw="$work/raw-$provider" out="$work/norm-$provider.json" meta="$work/meta-$provider.json"
+  mkdir -p "$raw"
+
+  local probe; probe="$("provider_${provider}_probe" 2>/dev/null)"
+  if [ "$(printf '%s' "$probe" | jq -r '.available and .authed')" != true ]; then
+    jq -n --arg p "$provider" --arg e "$(printf '%s' "$probe" | jq -r '.note // "provider unavailable"')" \
+      '{provider:$p,ok:false,error:$e}' > "$meta"
+    return 1
+  fi
+
+  if [ -n "$override" ]; then export GOBLIN_MODEL_OVERRIDE="$override"
+  else unset GOBLIN_MODEL_OVERRIDE
+  fi
+  if findings_run "$provider" "$prompt" "$dir" "$out" "$raw"; then
+    jq -n --arg p "$provider" --arg m "${GOBLIN_P_MODEL:-$provider}" \
+      --argjson cost "${GOBLIN_P_COST_USD:-0}" --argjson ms "${GOBLIN_P_DURATION_MS:-0}" \
+      '{provider:$p,ok:true,model:$m,costUsd:$cost,durationMs:$ms}' > "$meta"
+    return 0
+  fi
+  jq -n --arg p "$provider" --arg e "${GOBLIN_P_ERRMSG:-review failed}" \
+    --arg k "${GOBLIN_P_ERRKIND:-other}" '{provider:$p,ok:false,kind:$k,error:$e}' > "$meta"
+  return 1
+}
+
+reviewer_checkout() {
+  local source="$1" dest="$2" sha
+  mkdir -p "$dest"
+  if git -C "$source" rev-parse --git-dir >/dev/null 2>&1; then
+    sha="$(git -C "$source" rev-parse HEAD 2>/dev/null)"
+    rmdir "$dest" 2>/dev/null || true
+    git clone --quiet --shared --no-checkout "$source" "$dest" >/dev/null 2>&1 \
+      && git -C "$dest" checkout --quiet --detach "$sha" >/dev/null 2>&1 \
+      && return 0
+  fi
+  # Diff-only fallback: the prompt already contains the complete review input.
+  mkdir -p "$dest"
+}
+
+# reviewers_run <plan.json> <prompt> <repo-dir> <work-dir>
+#
+# Succeeds when AT LEAST ONE reviewer produced a review. Failing because a single
+# provider was missing used to throw away the other's finished work: engine_review_pr
+# short-circuits on a non-zero return, so a Claude-authored PR on a machine without
+# cursor logged a failure, backed the head off through attempt_record so it would
+# not be retried, and posted nothing — while codex sat there having completed.
+reviewers_run() {
+  local plan="$1" prompt="$2" dir="$3" work="$4" jobs="$work/reviewer-jobs" p override pid
+  : > "$jobs"
+  while IFS="$(printf '\t')" read -r p override; do
+    [ -n "$p" ] || continue
+    local reviewer_dir="$work/repo-$p"
+    if ! reviewer_checkout "$dir" "$reviewer_dir"; then
+      # Record it as this reviewer's failure and carry on. Returning here
+      # abandoned reviewers already running in the background — their pids were
+      # never waited on, so they were killed with the work dir.
+      jq -n --arg p "$p" \
+        '{provider:$p,ok:false,kind:"checkout",error:"could not stage a working copy"}' \
+        > "$work/meta-$p.json"
+      continue
+    fi
+    reviewer_run_one "$p" "$override" "$prompt" "$reviewer_dir" "$work" &
+    pid=$!
+    printf '%s\t%s\n' "$p" "$pid" >> "$jobs"
+  done <<EOF
+$(jq -r '.reviewers[] | [.provider,.modelOverride] | @tsv' "$plan")
+EOF
+
+  local ok=0 failed=0
+  # `done < "$jobs"`, not a pipe: a pipe would run this in a subshell and the
+  # counters would not survive it.
+  while IFS="$(printf '\t')" read -r p pid; do
+    if wait "$pid"; then ok=$((ok + 1)); else failed=$((failed + 1)); fi
+  done < "$jobs"
+
+  [ "$ok" -gt 0 ] && [ "$failed" -gt 0 ] \
+    && log "  $failed reviewer(s) failed; continuing with the $ok that finished"
+  [ "$ok" -gt 0 ]
+}
+
+# reviewers_merge <plan.json> <work-dir> <findings.json> <final-plan.json>
+#
+# A reviewer that failed keeps its metadata in the final plan — so the run record
+# shows who was asked and why they did not answer — but contributes no findings.
+# Slurping norm-<p>.json unconditionally aborted the whole merge for a provider
+# that never wrote one, which turned one reviewer's absence into a total loss.
+reviewers_merge() {
+  local plan="$1" work="$2" out="$3" final="$4" merged="$work/merged-stage.json" p ok_any=false
+  jq '. + {results:[]}' "$plan" > "$final"
+  printf '{"schema_version":1,"summary":"","suggested_verdict":"comment","intent_notes":[],"findings":[]}' > "$merged"
+
+  local meta norm ok
+  for p in $(jq -r '.reviewers[].provider' "$plan"); do
+    meta="$work/meta-$p.json"; norm="$work/norm-$p.json"; ok=false
+    [ -s "$meta" ] || jq -n --arg p "$p" \
+      '{provider:$p,ok:false,error:"reviewer never reported"}' > "$meta"
+    [ "$(jq -r '.ok // false' "$meta" 2>/dev/null)" = true ] && [ -s "$norm" ] && ok=true
+
+    # Metadata is folded in either way: a failure that leaves no trace is how you
+    # end up staring at a half-empty review with nothing to explain it.
+    jq --slurpfile m "$meta" --arg p "$p" '
+      .reviewers |= map(if .provider == $p then . + {
+        model:($m[0].model // $p), costUsd:($m[0].costUsd // 0), durationMs:($m[0].durationMs // 0),
+        ok:($m[0].ok // false), error:($m[0].error // "")
+      } else . end)
+      | .results += [$m[0]]' "$final" > "$final.next" && mv "$final.next" "$final"
+
+    [ "$ok" = true ] || continue
+    ok_any=true
+    jq --slurpfile r "$norm" --slurpfile m "$meta" --arg p "$p" '
+      .summary += (if .summary == "" then "" else "\n\n" end)
+        + "#### " + ($p | ascii_upcase) + " — independent review\n\n" + ($r[0].summary // "")
+      | .findings += [ $r[0].findings[]? + {reviewer:$p, reviewerModel:($m[0].model // $p)} ]
+      | .intent_notes += [($r[0].intent_note // empty) + {reviewer:$p}]
+    ' "$merged" > "$merged.next" && mv "$merged.next" "$merged"
+  done
+
+  [ "$ok_any" = true ] || { log "  no reviewer produced a usable review"; return 1; }
+
+  local max; max="$(cfg_get '.maxFindings' 25)"
+  jq --argjson max "$max" '
+    def rank: {blocker:0,convention:1,risk:2,question:3,nit:4}[.] // 9;
+    # Two reviewers describing the SAME defect must collapse into one comment.
+    # Grouping by .id could never do that: the id is a hash of path + title, and
+    # independent models do not choose byte-identical titles. The proof was this
+    # feature reviewing itself — codex called it "Continue when one reviewer
+    # succeeds", cursor called it "Treat any reviewer failure as total failure",
+    # same file, same line, and it posted two blockers for one bug.
+    #
+    # Position is the reliable join: same file, same side, same line is the same
+    # defect in practice. Merging is lossless — every reviewer body is kept and
+    # attributed — so the worst case for two genuinely distinct remarks on one
+    # line is a single comment with two labelled paragraphs, which still beats
+    # two comments. Findings with no line keep the old title-based key so that
+    # file-level remarks do not all collapse into one.
+    def posn:
+      [ (.path // "repo"),
+        (.side // "RIGHT"),
+        (if (.line // 0) > 0 then (.line | tostring)
+         else "t/" + (.title | ascii_downcase) end) ];
+    # Position alone is not a safe merge key: it also collapsed two DISTINCT
+    # findings from the SAME reviewer at the same line into one, keeping only
+    # the title, severity and suggestion of the FIRST while burying the body
+    # of the second underneath it — the opposite of a lossless merge. _slot
+    # ranks each finding among the findings that same reviewer raised at that
+    # position, so two different reviewers still merge at one line (both at
+    # slot 0), while two distinct findings from one reviewer at that same
+    # line stay two findings (slot 0 and slot 1) instead of one.
+    ( [ .findings
+        | group_by([.reviewer] + posn)
+        | .[]
+        | to_entries[] | .value + {_slot: .key} ]
+    ) as $slotted
+    | .findings = (
+      $slotted | group_by(posn + [._slot]) | map(
+        sort_by(.severity | rank) as $g
+        | ($g | map(.reviewer) | unique) as $who
+        | $g[0] + {
+            reviewers: ($g | map({provider:.reviewer,model:.reviewerModel}) | unique_by(.provider)),
+            # Only attribute when more than one reviewer is in the group;
+            # prefixing a lone reviewer with its own name is noise.
+            body: (if ($who | length) <= 1 then ($g | map(.body) | join("\n\n"))
+                   else ($g | map("**" + (.reviewer|ascii_upcase) + ":** " + .body) | join("\n\n")) end)
+          }
+        | del(.reviewer,.reviewerModel,._slot)
+      ) | sort_by(.severity | rank) | .[0:$max]
+    )
+    | .intent_note = (
+        if (.intent_notes|length) == 0 then null else
+          .intent_notes as $notes
+          | {issue: ($notes | map(.issue // "") | map(select(. != "")) | first // ""),
+             verdict: ($notes | map(.verdict // "unknown")
+               | sort_by({diverges:0,partial:1,unknown:2,fulfils:3,no_ticket:4}[.] // 5) | first),
+             body: ($notes | map("**" + (.reviewer|ascii_upcase) + ":** " + (.body // "")) | join("\n\n"))}
+        end)
+    | del(.intent_notes)
+  ' "$merged" > "$out"
+}

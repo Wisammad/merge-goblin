@@ -1242,7 +1242,10 @@
     // ids verified against `cursor-agent models`. The list here was previously
     // guessed, and the guesses were not ids cursor knows — so choosing one saved
     // happily and only failed later, at review time, as an opaque provider error.
-    cursor: ['cursor-grok-4.5-high', 'claude-4.5-sonnet-thinking', 'gpt-5.3-codex', 'composer-2.5', ''],
+    // Grok 4.6 leads because it is what the Goblin now configures by default; a
+    // build of cursor-agent too old to know it falls back to the CLI's own pick.
+    cursor: ['cursor-grok-4.6-high', 'cursor-grok-4.6-xhigh', 'cursor-grok-4.5-high',
+      'claude-opus-5-thinking-high', 'gpt-5.3-codex', 'composer-2.5', ''],
   };
   /* Sentinel for the Custom… option. Provably impossible as a real model name:
    * the bridge's pattern is ^[A-Za-z0-9._:-]{0,64}$, which has no underscore, so
@@ -2400,7 +2403,7 @@
         repos: [{ slug: 'mockorg/mock-repo', enabled: true }, { slug: 'mockorg/other', enabled: false }],
         fleet: ['mock-teammate'],
         fleetAssignment: true, verdictMode: 'comment', allowApprove: false,
-        maxReviewsPerDay: 20, maxReviewsPerRun: 5, maxFindings: 25,
+        maxReviewsPerDay: 30, maxReviewsPerRun: 5, maxFindings: 25,
         postCommitStatus: true, incrementalReview: true, skipIfHumanReviewed: true,
         notify: { started: true, posted: true, failed: true, budget: true, sound: false },
       },

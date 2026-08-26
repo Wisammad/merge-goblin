@@ -84,6 +84,21 @@ findings_verdict() {
   esac
 }
 
+# GitHub only lets a pull request author leave a COMMENT review on their own PR.
+# Keep every finding and its severity; only clamp the review action GitHub would
+# reject with HTTP 422.
+findings_review_event() {
+  local file="$1" author="${2:-}" reviewer="${3:-}" event
+  event="$(findings_verdict "$file")"
+  if [ -n "$author" ] && [ -n "$reviewer" ] \
+     && [ "$(lc "$author")" = "$(lc "$reviewer")" ] \
+     && [ "$event" != "COMMENT" ]; then
+    printf 'COMMENT\n'
+  else
+    printf '%s\n' "$event"
+  fi
+}
+
 # The model subprocess runs a third-party CLI with an untrusted PR checkout as
 # its working directory. engine_auth exports GH_TOKEN and the GIT_CONFIG_* URL
 # rewrite process-wide so git can authenticate without the keychain (launchd

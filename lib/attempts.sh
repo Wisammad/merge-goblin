@@ -6,8 +6,8 @@
 # model chokes on, a provider that is signed out, an oversized PR — were retried
 # every interval, forever, at full price, with a notification each time.
 #
-# State lives in ~/.goblin/attempts.json, keyed "<pr>:<headSha>":
-#   { "1234:abc123": { "n": 2, "lastAt": 1785, "nextAt": 1785+3600, "kind": "other" } }
+# State lives in ~/.goblin/attempts.json, keyed "<repo>#<pr>:<headSha>".
+# The two-argument form remains for state written by older installs.
 #
 # Keying on the head sha means a new push resets the counter for free: the key
 # simply does not exist yet. That is the behaviour you want — a push is exactly
@@ -29,18 +29,39 @@ attempt_file() { printf '%s/attempts.json' "$GOBLIN_HOME"; }
 # The one place the key shape is written down. engine.sh and the panel disagreed
 # about it once, which meant the panel reported nothing blocked while the engine
 # was backing off every PR.
-attempt_key() { printf '%s:%s' "$1" "$2"; }
+attempt_key() {
+  if [ "$#" -ge 3 ]; then
+    if [ -n "$1" ]; then printf '%s#%s:%s' "$1" "$2" "$3"
+    else printf '%s:%s' "$2" "$3"
+    fi
+  else
+    printf '%s:%s' "$1" "$2"
+  fi
+}
 
+# `key` is always the current "repo#pr:head" shape (see attempt_key), but an
+# install upgraded from before repo-scoping can have an active backoff filed
+# under the pre-migration "pr:head" shape. ledger_reviewed already reads both
+# shapes (state.sh); this did not, so after an upgrade an in-flight backoff
+# under the old key was invisible and the head it was protecting got retried
+# immediately instead of waiting out its delay.
 attempt_blocked() {
   local key="$1" f; f="$(attempt_file)"
   [ -f "$f" ] || return 1
-  local next; next="$(jq -r --arg k "$key" '.[$k].nextAt // 0' "$f" 2>/dev/null)"
+  local legacy="${key#*#}"
+  local next; next="$(jq -r --arg k "$key" --arg k2 "$legacy" \
+    '[.[$k].nextAt, .[$k2].nextAt] | map(select(. != null)) | max // 0' "$f" 2>/dev/null)"
   [ "${next:-0}" = "null" ] && next=0
   [ "$(now_epoch)" -lt "${next:-0}" ] 2>/dev/null
 }
 
 attempt_record() {
   local key="$1" kind="${2:-other}" f; f="$(attempt_file)"
+  # goblin_state_lock can time out and return failure while another process
+  # still holds the lock (see core.sh); unlocking unconditionally in that case
+  # would rmdir the OTHER process's lock mid-write. Only the call that actually
+  # acquired it may release it.
+  local locked=false; goblin_state_lock attempts && locked=true
   [ -f "$f" ] || echo '{}' > "$f"
   local maxa base cap n delay
   maxa="$(cfg_get '.failure.maxAttempts' 3)"
@@ -60,6 +81,7 @@ attempt_record() {
      --argjson next "$(( $(now_epoch) + delay ))" --arg kind "$kind" \
      '.[$k] = {n:$n, lastAt:$at, nextAt:$next, kind:$kind}' "$f" > "$f.tmp" 2>/dev/null \
      && mv "$f.tmp" "$f"
+  [ "$locked" = true ] && goblin_state_unlock attempts
   [ "$delay" -gt 0 ] && log "  #${key%%:*}: $n consecutive failures — holding this commit for $((delay / 60))m"
   return 0
 }
@@ -67,7 +89,10 @@ attempt_record() {
 attempt_clear() {
   local key="$1" f; f="$(attempt_file)"
   [ -f "$f" ] || return 0
-  jq --arg k "$key" 'del(.[$k])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  local legacy="${key#*#}"
+  local locked=false; goblin_state_lock attempts && locked=true
+  jq --arg k "$key" --arg k2 "$legacy" 'del(.[$k], .[$k2])' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  [ "$locked" = true ] && goblin_state_unlock attempts
 }
 
 # attempt_reason <key> — one human-readable line for the panel.
@@ -102,7 +127,8 @@ attempt_stuck_json() {
     [ to_entries[]
       | select((.value.n // 0) >= $maxa)
       | select((.value.nextAt // 0) > $now)
-      | { number: ((.key | split(":") | .[0] | tonumber?) // 0),
+      | { number: ((.key | split(":") | .[0] | split("#") | last | tonumber?) // 0),
+          repo:   ((.key | split(":") | .[0] | split("#") | if length > 1 then .[0] else "" end)),
           head:   ((.key | split(":") | .[1]) // ""),
           n:      (.value.n // 0),
           kind:   (.value.kind // ""),

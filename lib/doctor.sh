@@ -94,7 +94,18 @@ doctor_identity() {
   local tok whoami
   tok="$(gh auth token --user "$want" 2>/dev/null)"
   if [ -z "$tok" ]; then
-    _doc fail "github token" "no stored token for '$want'" "gh auth login --user $want"
+    # One symptom, two unrelated causes — and naming the wrong one costs a detour.
+    # gh IS logged in (checked above), just not as `$want`, so a login gh has never
+    # heard of is nearly always a typo on OUR side rather than a missing gh session.
+    # Say which account gh actually has and offer to adopt it. The old hint here was
+    # `gh auth login --user`, a flag gh does not have: it sent people through an
+    # "unknown flag" error and a redundant re-login before anyone looked at config.
+    if [ -n "$active" ] && [ "$active" != "$want" ]; then
+      _doc fail "github identity" "set to '$want', but gh is logged in as '$active'" \
+        "$GOBLIN_SLUG config set .identity.githubLogin $active"
+    else
+      _doc fail "github token" "no stored token for '$want'" "gh auth login"
+    fi
     return
   fi
   whoami="$(GH_TOKEN="$tok" gh api user --jq .login 2>/dev/null)"
@@ -107,7 +118,9 @@ doctor_identity() {
       _doc ok "github account" "$want"
     fi
   else
-    _doc fail "github token" "token for '$want' resolves to '$whoami'" "gh auth refresh --user $want"
+    # `gh auth refresh --user` is likewise not a flag; re-storing the credential is.
+    _doc fail "github token" "the stored token for '$want' belongs to '$whoami'" \
+      "gh auth logout --user $want && gh auth login"
   fi
   GOBLIN_LOGIN="$want"; export GH_TOKEN="$tok"
 }

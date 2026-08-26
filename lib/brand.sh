@@ -28,6 +28,13 @@ GOBLIN_MARKER_NS="$GOBLIN_SLUG"
 # or the Goblin would forget what it had already reviewed and post duplicates.
 GOBLIN_MARKER_NS_LEGACY="bob"
 
+# The model the Cursor adapter reviews with when nothing else is configured.
+# Cursor's own default is `auto`, which picks whatever is cheapest for the account
+# rather than whatever is best at reading code, so the Goblin names one. Ids are
+# what `cursor-agent models` prints; a stale id fails at review time with an
+# opaque provider error, so this changes only against that list.
+GOBLIN_CURSOR_DEFAULT_MODEL="cursor-grok-4.6-high"
+
 # Severity vocabulary. The order here IS the display/sort order.
 GOBLIN_SEVERITIES="blocker convention risk nit question"
 
