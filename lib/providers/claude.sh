@@ -24,12 +24,24 @@ provider_claude_probe() {
     jq -nc '{name:"claude",available:false,authed:false,note:"claude CLI not found"}'; return 0
   fi
   ver="$("$bin" --version 2>/dev/null | head -1)"
-  auth="$("$bin" auth status 2>/dev/null)"
+  # Retry an empty answer rather than reading it as "signed out". With no output
+  # jq produces nothing, ${logged:-false} quietly becomes false, and claude drops
+  # out of the reviewer plan for the whole run with no note explaining why — the
+  # same failure the cursor probe had, arrived at through jq instead of a case.
+  local i=0
+  while [ "$i" -lt 3 ]; do
+    auth="$("$bin" auth status 2>/dev/null)"
+    [ -n "$auth" ] && break
+    i=$((i + 1)); [ "$i" -lt 3 ] && sleep 1
+  done
   logged="$(printf '%s' "$auth" | jq -r '.loggedIn // false' 2>/dev/null)"
   method="$(printf '%s' "$auth" | jq -r '(.subscriptionType // .authMethod) // ""' 2>/dev/null)"
-  jq -nc --arg bin "$bin" --arg ver "$ver" --arg m "$method" --argjson logged "${logged:-false}" \
+  local note=""
+  [ -z "$auth" ] && note="claude auth status said nothing three times — could not tell if it is signed in"
+  jq -nc --arg bin "$bin" --arg ver "$ver" --arg m "$method" --arg note "$note" \
+         --argjson logged "${logged:-false}" \
     '{name:"claude", available:true, authed:$logged, authMode:$m, version:$ver,
-      costKnown:true, schemaMode:"native", bin:$bin, note:""}'
+      costKnown:true, schemaMode:"native", bin:$bin, note:$note}'
 }
 
 # provider_claude_review <prompt_file> <repo_dir> <schema> <out_json> <raw_dir>

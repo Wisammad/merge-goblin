@@ -68,6 +68,9 @@ cmd_run() {
   fi
 
   cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+  # Before the gates, so scratch is reclaimed even on a paused or budget-capped
+  # run — those are exactly the runs that leave nothing behind to clean up later.
+  goblin_tmp_gc
   # Only the scheduled path writes to the log file; interactive runs print.
   [ "$SCHEDULED" = true ] && log_open
 
@@ -483,6 +486,7 @@ cmd_url() {
   # A pasted link is someone asking about one specific PR, which is the one case
   # where reviewing it exhaustively is worth several passes — see engine_sweep.
   cfg_ensure; cfg_backfill_defaults; goblin_ensure_dirs
+  goblin_tmp_gc
   if [ "$once" != true ] && [ "$(cfg_get '.sweepUntilClean' true)" = "true" ]; then
     engine_sweep "$repo" "$pr" ""
     return $?

@@ -27,15 +27,30 @@ provider_cursor_probe() {
   ver="$("$bin" --version 2>/dev/null | head -1)"
   # `cursor-agent status` exits 0 even when signed out, so the exit code says
   # nothing — read what it actually printed.
-  local st; st="$("$bin" status 2>/dev/null)"
+  #
+  # But empty output is NOT "signed out". It used to share a branch with the real
+  # signed-out strings, so a single status call that printed nothing refused the
+  # review with "run: cursor-agent login" while the account was signed in the
+  # whole time — which is what took down #1875 and #1910 on 2026-09-10, and it
+  # named the one thing that was not wrong. Retry first; if it still says nothing,
+  # report that we could not tell instead of prescribing a login.
+  local st="" i=0 unknown=false
+  while [ "$i" -lt 3 ]; do
+    st="$("$bin" status 2>/dev/null)"
+    [ -n "$st" ] && break
+    i=$((i + 1)); [ "$i" -lt 3 ] && sleep 1
+  done
   case "$(lc "$st")" in
-    *"not logged in"*|*"not authenticated"*|*"no active"*|"") authed=false ;;
+    *"not logged in"*|*"not authenticated"*|*"no active"*) authed=false ;;
+    "") authed=false; unknown=true ;;
     *) authed=true ;;
   esac
-  jq -nc --arg bin "$bin" --arg ver "$ver" --argjson authed "$authed" \
+  jq -nc --arg bin "$bin" --arg ver "$ver" --argjson authed "$authed" --argjson unknown "$unknown" \
     '{name:"cursor", available:true, authed:$authed, authMode:"cursor", version:$ver,
       costKnown:false, schemaMode:"prompt-only", bin:$bin,
-      note:(if $authed then "" else "run: cursor-agent login" end)}'
+      note:(if $authed then ""
+            elif $unknown then "cursor-agent status said nothing three times — could not tell if it is signed in"
+            else "run: cursor-agent login" end)}'
 }
 
 # provider_cursor_invoke <bin> <dir> <timeout> <prompt> <raw> [model]

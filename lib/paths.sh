@@ -59,6 +59,30 @@ goblin_ensure_dirs() {
   chmod 700 "$GOBLIN_HOME" 2>/dev/null || true
 }
 
+# Sweep abandoned run scratch out of RUNTMP.
+#
+# Nothing else ever does: a run deletes its own scratch through a trap on
+# EXIT/INT/TERM, so a SIGKILL, a crash, or a laptop that sleeps mid-review leaks
+# the whole directory permanently. Measured 2026-09-10: 108MB across 529 entries
+# reaching back a month, including one abandoned 84MB checkout and 508 stale
+# meta-*.json. There is no `goblin clean`, so it only ever grew.
+#
+# Age is the safe test, not PID ownership. A live run's scratch is seconds old and
+# a concurrent fanout worker's is minutes old, so anything older than a day belongs
+# to a run that is definitively gone — which also makes this safe to call while
+# other goblins are running. Tune with: goblin config set .tmpRetentionDays N
+goblin_tmp_gc() {
+  # At most one sweep per process: the run entry points overlap (a pasted link
+  # goes through cmd_url and then cmd_run), so calling this twice must be free.
+  [ -n "${GOBLIN_TMP_GC_DONE:-}" ] && return 0
+  GOBLIN_TMP_GC_DONE=1
+  [ -d "$RUNTMP" ] || return 0
+  local days; days="$(cfg_get '.tmpRetentionDays' 2)"
+  case "$days" in ''|*[!0-9]*) days=2 ;; esac
+  [ "$days" -lt 1 ] && days=1
+  find "$RUNTMP" -mindepth 1 -maxdepth 1 -mtime "+$days" -exec rm -rf {} + 2>/dev/null || true
+}
+
 # Scratch clone path for an owner/name slug.
 goblin_repo_dir() {
   printf '%s/%s' "$REPOS_DIR" "$(printf '%s' "$1" | tr '/' '_' | tr -cd '[:alnum:]._-')"
