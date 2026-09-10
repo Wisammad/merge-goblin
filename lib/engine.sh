@@ -567,11 +567,20 @@ engine_auth() {
   command -v git >/dev/null 2>&1 || { log "git not found"; return 1; }
   GOBLIN_LOGIN="$(goblin_login)"
   gh_pin_token "$GOBLIN_LOGIN" || { log "could not obtain a gh token for '$GOBLIN_LOGIN'"; return 1; }
-  if ! gh_assert_identity "$GOBLIN_LOGIN"; then
-    log "token identity mismatch: token is '$(gh api user --jq .login 2>/dev/null)', expected '$GOBLIN_LOGIN' — abort"
-    notify failed "$GOBLIN_NAME ⚠️" "github token is not $GOBLIN_LOGIN"
-    return 1
-  fi
+  gh_assert_identity "$GOBLIN_LOGIN"
+  case $? in
+    1)
+      log "token identity mismatch: token is '$GH_IDENTITY_ACTUAL', expected '$GOBLIN_LOGIN' — abort"
+      notify failed "$GOBLIN_NAME ⚠️" "github token is not $GOBLIN_LOGIN"
+      return 1 ;;
+    2)
+      # Abort, but do not blame the token: every later step is an API call too, so
+      # there is nothing useful to do this pass. No notify — an unreachable API is
+      # transient by nature and the next run is seconds away; the old code fired a
+      # "your token is wrong" alert here, which is the wrong thing to go fix.
+      log "cannot reach the github api to confirm the token is '$GOBLIN_LOGIN' — abort, retrying next run"
+      return 1 ;;
+  esac
   # launchd can't reach the macOS keychain, so git gets its credentials from the
   # token via URL rewrite. Env vars mean every child git process inherits it.
   export GIT_CONFIG_COUNT=1

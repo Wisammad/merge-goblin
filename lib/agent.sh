@@ -81,11 +81,52 @@ gh_pin_token() {
 }
 
 # Verify the pinned token really is who we think, so we never review as someone else.
+#
+# Three outcomes, not two. GitHub being briefly unreachable is not an answer about
+# who the token belongs to, and reporting it as one is a lie that costs an
+# afternoon: a blip in `gh api user` used to surface as
+#   token identity mismatch: token is '', expected 'you' - abort
+# plus a "github token is not you" push, which accuses the one thing that is
+# definitely fine and sends you off rotating a perfectly good credential.
+#   0 - confirmed: the token is $want
+#   1 - confirmed otherwise: GitHub answered, and named somebody else. Abort.
+#   2 - unknown: could not ask. Not a mismatch; the caller says so honestly.
+# GH_IDENTITY_ACTUAL carries whatever GitHub said, so the caller reports the login
+# we actually saw rather than re-asking (a second call that can fail the same way,
+# which is why the old message printed an empty string).
 gh_assert_identity() {
-  local want="${1:-$GOBLIN_LOGIN}" actual
-  actual="$(gh api user --jq .login 2>/dev/null)"
+  local want="${1:-$GOBLIN_LOGIN}" i=0
+  GH_IDENTITY_ACTUAL=""
   [ -z "$want" ] && return 0
-  [ "$actual" = "$want" ]
+  while [ "$i" -lt 3 ]; do
+    GH_IDENTITY_ACTUAL="$(gh api user --jq .login 2>/dev/null)"
+    if [ -n "$GH_IDENTITY_ACTUAL" ]; then
+      # Logins are case-insensitive on GitHub, so `you` and `You` are one account.
+      # Only a config typo ever makes the case differ, and aborting over that is a
+      # mismatch we invented rather than one GitHub reported.
+      [ "$(lc "$GH_IDENTITY_ACTUAL")" = "$(lc "$want")" ] && return 0
+      return 1
+    fi
+    i=$((i + 1)); [ "$i" -lt 3 ] && sleep 1
+  done
+  return 2
+}
+
+# Does this account actually have the repo? Same three-way split as the identity
+# check, for the same reason: "not visible to this account" sends you to check org
+# access and SSO grants, so it must only be said when GitHub really said no.
+#   0 - visible   1 - GitHub answered no   2 - could not ask
+# The discriminator is a second call the repo answer does not depend on: if the API
+# is reachable at all, then a repo call that still fails is a real no. `rate_limit`
+# is the probe because it does not itself consume quota.
+gh_repo_visible() {
+  local slug="$1" i=0
+  while [ "$i" -lt 3 ]; do
+    gh api "repos/$slug" --jq .full_name >/dev/null 2>&1 && return 0
+    i=$((i + 1)); [ "$i" -lt 3 ] && sleep 1
+  done
+  gh api rate_limit >/dev/null 2>&1 && return 1
+  return 2
 }
 
 # Pin the token and confirm the identity, without any of the engine's git

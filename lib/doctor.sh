@@ -108,9 +108,22 @@ doctor_identity() {
     fi
     return
   fi
-  whoami="$(GH_TOKEN="$tok" gh api user --jq .login 2>/dev/null)"
-  if [ "$whoami" = "$want" ]; then
-    if [ "$active" != "$want" ]; then
+  GH_TOKEN="$tok" gh_assert_identity "$want"; local idrc=$?
+  whoami="$GH_IDENTITY_ACTUAL"
+  if [ "$idrc" -eq 2 ]; then
+    # Never diagnose a stored token from a call that did not complete. Doctor is the
+    # tool you reach for when something is already wrong; sending you after the
+    # wrong cause is worse here than anywhere else.
+    _doc warn "github token" "could not reach the github api to check the token for '$want'" \
+      "transient — re-run $GOBLIN_SLUG doctor"
+    GOBLIN_LOGIN="$want"; export GH_TOKEN="$tok"
+    return
+  fi
+  if [ "$idrc" -eq 0 ]; then
+    # Case-insensitive for the same reason the identity check is: `you` and `You`
+    # are one GitHub account, and nudging somebody to "fix" their account over a
+    # config typo's capitalisation is advice about nothing.
+    if [ "$(lc "$active")" != "$(lc "$want")" ]; then
       # Not fatal: the Goblin pins the token per call, so this only affects YOUR shell.
       _doc warn "github account" "the Goblin uses '$want'; your shell's active account is '$active'" \
         "$GOBLIN_SLUG fix-account   (only needed for your own gh commands)"
@@ -155,12 +168,15 @@ doctor_repos() {
   fi
   local slug dir
   for slug in $repos; do
-    if gh api "repos/$slug" --jq .full_name >/dev/null 2>&1; then
-      _doc ok "repo $slug" "reachable"
-    else
-      _doc fail "repo $slug" "not visible to this account" "check access, or: $GOBLIN_SLUG repos rm $slug"
-      continue
-    fi
+    gh_repo_visible "$slug"
+    case $? in
+      0) _doc ok "repo $slug" "reachable" ;;
+      2) _doc warn "repo $slug" "could not reach the github api to check" \
+           "transient — re-run $GOBLIN_SLUG doctor" ;;
+      *)
+        _doc fail "repo $slug" "not visible to this account" "check access, or: $GOBLIN_SLUG repos rm $slug"
+        continue ;;
+    esac
     dir="$(goblin_repo_dir "$slug")"
     if [ -d "$dir/.git" ] || [ -L "$dir" ]; then
       local dirty; dirty="$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
