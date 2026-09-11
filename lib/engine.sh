@@ -276,9 +276,13 @@ engine_sweep() {
 
   rm -f "$result" "$seen" 2>/dev/null
   if [ "$outcome" != "posted" ]; then return 1; fi
-  log "sweep hit its $max-pass cap and pass $max was still finding things ($total posted)"
+  # This ceiling stays a real stop even when caps are advisory: the sweep ends on
+  # its own once a pass raises nothing new, so the only thing this catches is a
+  # sweep that would otherwise never terminate. It is a loop guard, not a quota —
+  # but reaching it is a result, not a failure, so say so and exit 0.
+  log "milestone: $max passes on $repo#$pr, still finding things ($total posted)"
   log "run it again, or raise maxPassesPerPr: $GOBLIN_SLUG config set .maxPassesPerPr $((max + 3))"
-  return 1
+  return 0
 }
 
 # engine_sweep_pass <repo> <pr> <result-file>
@@ -522,6 +526,23 @@ engine_gates() {
 
 # Checked before EVERY review, not just at run start — a backlog run used to
 # blow past the cap by 2x before the next cycle noticed.
+# With .capsAdvisory the caps stop being fences and become markers: crossing one
+# is reported and the run carries on. Default stays blocking, because the day cap
+# is the ONLY real guard for a subscription provider — `cost not reported` pins
+# today_spend() at 0 forever, so budgetCapUsd can never fire, and the failure it
+# was protecting against is tripping the provider's own quota, which takes the
+# Goblin down for every repo rather than for the PR that caused it.
+caps_advisory() { [ "$(cfg_get '.capsAdvisory' false)" = "true" ]; }
+
+# Report a milestone once per day per multiple, so an advisory cap marks progress
+# (80, 160, 240 reviews) instead of reprinting on every run once it is past.
+engine_milestone() {   # <kind> <multiple> <message>
+  local marker="$GOBLIN_HOME/.milestone-$1" stamp; stamp="$(date +%Y-%m-%d):$2"
+  [ "$(cat "$marker" 2>/dev/null)" = "$stamp" ] && return 0
+  printf '%s' "$stamp" > "$marker" 2>/dev/null
+  log "milestone: $3"
+}
+
 engine_budget_ok() {
   local cap spent max_run max_day done_today
   cap="$(cfg_get '.budgetCapUsd' 0)"
@@ -529,8 +550,13 @@ engine_budget_ok() {
   max_day="$(cfg_get '.maxReviewsPerDay' 0)"
 
   if [ "${max_run:-0}" -gt 0 ] && [ "$REVIEWS_THIS_RUN" -ge "$max_run" ]; then
-    log "hit maxReviewsPerRun ($max_run) — stopping this cycle"
-    return 1
+    if caps_advisory; then
+      engine_milestone run "$(( REVIEWS_THIS_RUN / max_run ))" \
+        "$REVIEWS_THIS_RUN reviews this cycle (advisory cap $max_run) — continuing"
+    else
+      log "hit maxReviewsPerRun ($max_run) — stopping this cycle"
+      return 1
+    fi
   fi
 
   # A count cap as well as a dollar cap, because the dollar cap cannot protect a
@@ -545,14 +571,25 @@ engine_budget_ok() {
     # the authoritative gate: reservation_try below is the atomic one.
     done_today="$(( $(today_review_count) + $(reservation_count) ))"
     if [ "${done_today:-0}" -ge "$max_day" ] 2>/dev/null; then
-      log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
-      status_set '{"state":"paused","pausedReason":"quota","activity":""}'
-      engine_pass_write "the daily review cap ($done_today/$max_day) is reached"
-      return 1
+      if caps_advisory; then
+        engine_milestone reviews "$(( done_today / max_day ))" \
+          "$done_today reviews today (advisory cap $max_day) — continuing"
+      else
+        log "hit maxReviewsPerDay ($done_today/$max_day) — resumes tomorrow"
+        status_set '{"state":"paused","pausedReason":"quota","activity":""}'
+        engine_pass_write "the daily review cap ($done_today/$max_day) is reached"
+        return 1
+      fi
     fi
   fi
   spent="$(today_spend)"
   if [ "$(jq -n --argjson c "${cap:-0}" --argjson s "${spent:-0}" '($c>0) and ($s>=$c)' 2>/dev/null)" = "true" ]; then
+    if caps_advisory; then
+      engine_milestone budget "$(jq -n --argjson c "$cap" --argjson s "$spent" \
+        '(if $c > 0 then ($s / $c | floor) else 0 end)' 2>/dev/null)" \
+        "\$$spent spent today (advisory cap \$$cap) — continuing"
+      return 0
+    fi
     log "daily budget reached (\$$spent >= \$$cap)"
     local marker="$GOBLIN_HOME/.budget-notified" today; today="$(date +%Y-%m-%d)"
     if [ "$(cat "$marker" 2>/dev/null)" != "$today" ]; then
