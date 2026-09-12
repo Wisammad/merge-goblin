@@ -1072,7 +1072,26 @@ engine_checkout() {
     else log "  cloning $slug (one-time)"
     fi
     rm -rf "$dir"
-    git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
+    # Borrow objects from the persistent clone rather than refetching the repo.
+    # An isolated checkout was a full clone straight from GitHub: 771MB and
+    # minutes on this repo, per run, while an identical copy sat unused in
+    # repos/. Four concurrent sweeps meant 3.2GB of scratch and four simultaneous
+    # downloads of the same objects. With the reference it is 3.3MB and seconds.
+    #
+    # --reference-if-able, not --reference, so a missing or unusable base falls
+    # back to the full clone instead of failing the run. origin still points at
+    # GitHub, so `gh pr checkout` below is unchanged.
+    local base; base="$(goblin_repo_dir "$slug")"
+    if [ "$base" != "$dir" ] && [ -d "$base/.git" ]; then
+      # Borrowed objects live in the base repo, so a gc there could prune one out
+      # from under a live checkout. Cheap insurance: the base is scratch we
+      # refetch anyway, and nothing else depends on it staying packed.
+      git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
+      git clone --quiet --reference-if-able "$base" "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 \
+        || git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
+    else
+      git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
+    fi
   fi
   git -C "$dir" fetch --quiet origin >/dev/null 2>&1 || return 1
   git -C "$dir" reset --hard --quiet >/dev/null 2>&1

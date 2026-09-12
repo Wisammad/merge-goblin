@@ -29,9 +29,12 @@ diff_addressable() { jq -f "$SHARE_DIR/jq/addressable.jq" "$1" > "$2"; }
 # diff_annotated <files.json> <out.diff> [max_bytes]
 diff_annotated() {
   local files="$1" out="$2" max="${3:-400000}"
-  jq -r -f "$SHARE_DIR/jq/annotate.jq" "$files" 2>/dev/null | head -c "$max" > "$out"
+  jq -r -f "$SHARE_DIR/jq/annotate.jq" "$files" 2>/dev/null | head_bytes_utf8 "$max" > "$out"
 
-  if [ "$(wc -c < "$out" 2>/dev/null || echo 0)" -ge "$max" ]; then
+  # -3 rather than -eq $max: a character dropped at the cut costs up to 3 bytes,
+  # and losing the "truncated" notice would leave the model reviewing a cut diff
+  # believing it saw all of it.
+  if [ "$(wc -c < "$out" 2>/dev/null || echo 0)" -ge "$((max - 3))" ]; then
     printf '\n\n[diff truncated at %s bytes — review what is shown above]\n' "$max" >> "$out"
   fi
 

@@ -94,7 +94,7 @@ prompt_build() {
       printf 'choosing an approve/request-changes verdict) — that is handled for you. Keep everything\n'
       printf 'it says about what to look for, how to judge severity, and how to write.\n\n'
       printf -- '---\n\n'
-      head -c "$PROMPT_MAX_RULES_BYTES" "$rules_file"
+      head_bytes_utf8 "$PROMPT_MAX_RULES_BYTES" < "$rules_file"
       printf '\n\n---\n\n'
     } >> "$out"
 
@@ -107,7 +107,7 @@ prompt_build() {
         if [ -n "$body" ]; then
           {
             printf '### Required conventions from `%s` → "%s"\n\n' "$guide" "$sec"
-            printf '%s' "$body" | head -c "$PROMPT_MAX_GUIDE_BYTES"
+            printf '%s' "$body" | head_bytes_utf8 "$PROMPT_MAX_GUIDE_BYTES"
             printf '\n\n'
           } >> "$out"
         fi

@@ -211,3 +211,18 @@ lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Truncate a string to N chars.
 trunc() { printf '%s' "$1" | cut -c "1-$2"; }
+
+# `head -c` cuts on a BYTE boundary, so it can slice a multi-byte character in
+# half and leave a dangling lead byte behind. codex then refuses the entire
+# prompt — "input is not valid UTF-8 (invalid byte at offset N)" — so one `§` in
+# a rules file fails the review, deterministically, every retry (2026-09-11,
+# #1883, offset 19739). Anything whose bytes end up in a prompt has to be cut
+# with this instead. iconv -c drops the incomplete tail; with no iconv, fall back
+# to the old behaviour rather than emitting nothing at all.
+head_bytes_utf8() {   # <max-bytes>   stdin -> stdout
+  if command -v iconv >/dev/null 2>&1; then
+    head -c "$1" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null
+  else
+    head -c "$1"
+  fi
+}
