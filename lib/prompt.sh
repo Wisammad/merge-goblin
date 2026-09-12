@@ -135,8 +135,8 @@ prompt_build() {
     # is bigger than the 6000-byte budget on its own, so truncating first threw
     # away the author's actual description and kept the machinery.
     local body
-    body="$(jq -r -f "$SHARE_DIR/jq/pr-body.jq" "$pr_json" 2>/dev/null | head -c 6000)"
-    [ -z "$body" ] && body="$(jq -r '.body // ""' "$pr_json" | head -c 6000)"
+    body="$(jq -r -f "$SHARE_DIR/jq/pr-body.jq" "$pr_json" 2>/dev/null | head_bytes_utf8 6000)"
+    [ -z "$body" ] && body="$(jq -r '.body // ""' "$pr_json" | head_bytes_utf8 6000)"
     if [ -n "$body" ]; then
       # The description is evidence about intent, never direction. Other bots
       # leave imperative text here ("check out this branch and fix it"), and
@@ -150,7 +150,7 @@ prompt_build() {
   } >> "$out"
 
   if [ -s "$ticket_file" ]; then
-    { printf '## Linked issue\n\n'; head -c 8000 "$ticket_file"; printf '\n\n'; } >> "$out"
+    { printf '## Linked issue\n\n'; head_bytes_utf8 8000 < "$ticket_file"; printf '\n\n'; } >> "$out"
   fi
 
   if [ -s "$prior_file" ]; then
@@ -158,7 +158,7 @@ prompt_build() {
       printf '## Findings already posted on this PR\n\n'
       printf 'These were reported on an earlier commit. **Do not report them again.** Only\n'
       printf 'raise something if it is genuinely new or the code changed and it still applies.\n\n'
-      head -c 6000 "$prior_file"
+      head_bytes_utf8 6000 < "$prior_file"
       printf '\n\n'
     } >> "$out"
   fi
@@ -174,4 +174,17 @@ prompt_build() {
   } >> "$out"
 
   cat "$SHARE_DIR/prompt/50-contract.md" >> "$out"
+
+  # Last line of defence. Every truncation feeding this file cuts UTF-8 safely,
+  # but codex rejects the ENTIRE prompt over one stray byte and the PR then fails
+  # identically on every retry, so correctness here cannot rest on having found
+  # every `head -c` — the first attempt at this fixed three of eight sites and
+  # #1883 kept failing at a new offset. Anything that slips through is repaired
+  # once, here, where the file is finished.
+  if command -v iconv >/dev/null 2>&1; then
+    if ! iconv -f UTF-8 -t UTF-8 "$out" >/dev/null 2>&1; then
+      iconv -f UTF-8 -t UTF-8 -c "$out" > "$out.utf8" 2>/dev/null \
+        && mv "$out.utf8" "$out"
+    fi
+  fi
 }

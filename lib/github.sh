@@ -208,7 +208,7 @@ gh_ticket_context() {
       [ -n "$url" ] && printf 'Link: %s\n' "$url"
       if [ -n "$linkback" ]; then
         printf '\nIssue description (from the tracker):\n\n'
-        printf '%s\n' "$linkback" | sed 's/<[^>]*>//g' | head -c 6000
+        printf '%s\n' "$linkback" | sed 's/<[^>]*>//g' | head_bytes_utf8 6000
       fi
     } > "$out"
   fi
