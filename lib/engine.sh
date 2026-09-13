@@ -132,7 +132,16 @@ engine_run_lock_release() {
 }
 
 engine_checkout_dir() {
-  if [ -n "$ONLY_PR" ]; then printf '%s/checkout-%s-%s' "$RUNTMP" "$2" "$$"
+  # A sweep hands its passes one checkout. Each pass is a fresh process on
+  # purpose (see engine_sweep_pass), so keying this on $$ gave every pass its own
+  # directory: a 5-pass sweep cloned and deleted the repository five times, and
+  # the pass trap destroyed it on the way out each time. The pass isolation that
+  # comment is defending is about REVIEWS_THIS_RUN, the claim and the quota
+  # reservation — none of which live in the working tree — so sharing the tree
+  # costs none of it. engine_checkout already re-fetches and resets whatever it
+  # is handed, so a reused directory is brought back to a clean state anyway.
+  if [ -n "${GOBLIN_SWEEP_CHECKOUT:-}" ]; then printf '%s' "$GOBLIN_SWEEP_CHECKOUT"
+  elif [ -n "$ONLY_PR" ]; then printf '%s/checkout-%s-%s' "$RUNTMP" "$2" "$$"
   else goblin_repo_dir "$1"
   fi
 }
@@ -233,6 +242,13 @@ engine_sweep() {
 
   result="$RUNTMP/sweep-$$.json"
   seen="$RUNTMP/sweep-seen-$$.json"; echo '[]' > "$seen"
+
+  # One checkout for the whole sweep. Released below on every exit from this
+  # function; goblin_tmp_gc is the backstop if the sweep is killed outright.
+  local sweep_started per_pass="" cloned_once=false
+  sweep_started="$(now_epoch)"
+  GOBLIN_SWEEP_CHECKOUT="$RUNTMP/checkout-$pr-sweep$$"; export GOBLIN_SWEEP_CHECKOUT
+
   log "sweeping $repo#$pr until a pass finds nothing new (at most $max pass(es))"
 
   while [ "$pass" -lt "$max" ]; do
@@ -268,21 +284,55 @@ engine_sweep() {
         log "pass $pass raised nothing this sweep had not already seen — done after $pass pass(es), $total finding(s) posted"
       fi
       rm -f "$result" "$seen" 2>/dev/null
+      per_pass="${per_pass:+$per_pass, }pass $pass: 0"
+      engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
+        "$per_pass" "clean — pass $pass raised nothing new"
+      engine_sweep_release
       return 0
     fi
     total=$((total + fresh))
+    per_pass="${per_pass:+$per_pass, }pass $pass: $fresh"
     log "pass $pass posted $fresh new finding(s) — going again"
   done
 
   rm -f "$result" "$seen" 2>/dev/null
-  if [ "$outcome" != "posted" ]; then return 1; fi
+  if [ "$outcome" != "posted" ]; then
+    engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
+      "$per_pass" "stopped — ${outcome:-the pass reported no outcome}"
+    engine_sweep_release
+    return 1
+  fi
   # This ceiling stays a real stop even when caps are advisory: the sweep ends on
   # its own once a pass raises nothing new, so the only thing this catches is a
   # sweep that would otherwise never terminate. It is a loop guard, not a quota —
   # but reaching it is a result, not a failure, so say so and exit 0.
   log "milestone: $max passes on $repo#$pr, still finding things ($total posted)"
   log "run it again, or raise maxPassesPerPr: $GOBLIN_SLUG config set .maxPassesPerPr $((max + 3))"
+  engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
+    "$per_pass" "hit the $max-pass ceiling, still finding things"
+  engine_sweep_release
   return 0
+}
+
+engine_sweep_release() {
+  [ -n "${GOBLIN_SWEEP_CHECKOUT:-}" ] && rm -rf "$GOBLIN_SWEEP_CHECKOUT"
+  unset GOBLIN_SWEEP_CHECKOUT
+}
+
+# What the whole loop did, once, at the end — the per-pass lines scroll away and
+# the thing you actually want ("did this converge, and what did it cost") was
+# never stated anywhere.
+engine_sweep_summary() {   # <repo> <pr> <passes> <max> <total> <started> <per-pass> <verdict>
+  local repo="$1" pr="$2" passes="$3" max="$4" total="$5" started="$6" detail="$7" verdict="$8"
+  local secs mins
+  secs=$(( $(now_epoch) - started )); [ "$secs" -lt 0 ] && secs=0
+  mins=$(( secs / 60 ))
+  log "── sweep summary: $repo#$pr ──"
+  log "   passes     $passes of $max"
+  log "   findings   $total posted${detail:+  ($detail)}"
+  log "   duration   ${mins}m$(printf '%02d' $(( secs % 60 )))s"
+  log "   checkout   one clone, reused across $passes pass(es)"
+  log "   verdict    $verdict"
 }
 
 # engine_sweep_pass <repo> <pr> <result-file>
@@ -860,10 +910,16 @@ engine_review_pr() {
   # 2. a checkout, so the model can read surrounding code
   local repo_dir isolated_checkout=false
   repo_dir="$(engine_checkout_dir "$slug" "$pr")"
-  if [ -n "$ONLY_PR" ]; then isolated_checkout=true; ACTIVE_CHECKOUT="$repo_dir"; fi
+  # ACTIVE_CHECKOUT is what the EXIT trap deletes, so only claim it when this
+  # process owns the directory. A sweep-owned checkout outlives the pass and is
+  # released by the sweep.
+  if [ -n "$ONLY_PR" ]; then
+    isolated_checkout=true
+    [ -z "${GOBLIN_SWEEP_CHECKOUT:-}" ] && ACTIVE_CHECKOUT="$repo_dir"
+  fi
   if ! engine_checkout "$slug" "$pr" "$repo_dir"; then
     log "  #$pr: no local checkout (reviewing from diff only)"
-    [ "$isolated_checkout" = true ] && engine_checkout_release
+    [ "$isolated_checkout" = true ] && [ -z "${GOBLIN_SWEEP_CHECKOUT:-}" ] && engine_checkout_release
     repo_dir="$work"; isolated_checkout=false
   fi
 
