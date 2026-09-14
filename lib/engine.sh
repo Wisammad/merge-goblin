@@ -1006,7 +1006,11 @@ engine_publish() {
   author="$(jq -r '.author // ""' "$work/pr.json" 2>/dev/null)"
   event="$(findings_review_event "$work/norm.json" "$author" "$GOBLIN_LOGIN")"
   if [ "$event" != "$requested_event" ]; then
-    log "  #$pr: PR is authored by @$author — posting findings as COMMENT, not $requested_event"
+    if [ -n "$author" ]; then
+      log "  #$pr: PR is authored by @$author — posting findings as COMMENT, not $requested_event"
+    else
+      log "  #$pr: could not read the PR author — posting findings as COMMENT, not $requested_event"
+    fi
   fi
   render_review_body "$work/norm.json" "$work/split.json" "$pr" "$head" "$base" \
                      "$provider" "$model" "$GOBLIN_LOGIN" "$work/files.json" "$event" "$plan" > "$work/body.md"
@@ -1134,21 +1138,39 @@ engine_checkout() {
     # repos/. Four concurrent sweeps meant 3.2GB of scratch and four simultaneous
     # downloads of the same objects. With the reference it is 3.3MB and seconds.
     #
-    # --reference-if-able, not --reference, so a missing or unusable base falls
-    # back to the full clone instead of failing the run. origin still points at
-    # GitHub, so `gh pr checkout` below is unchanged.
-    local base; base="$(goblin_repo_dir "$slug")"
+    # Clone from the base on DISK, then point origin back at GitHub. Not
+    # `--reference <base> <url>`: that still negotiates the whole repository with
+    # the server, and when that transfer broke mid-way ("curl 18 Transferred a
+    # partial file", "early EOF") the old fallback answered a failed transfer by
+    # starting a BIGGER one -- a full 737MB clone. With several sweeps running
+    # that saturates the link, which causes more partial transfers, which trigger
+    # more full clones: `git ls-remote` measured 40s with two clones in flight
+    # against 4.5s with one. A local clone moves no bytes over the network at
+    # all, and the fetch below pulls only what the base is missing.
+    local base cerr; base="$(goblin_repo_dir "$slug")"
+    cerr="$(dirname "$dir")/.clone-err-$$"
     if [ "$base" != "$dir" ] && [ -d "$base/.git" ]; then
       # Borrowed objects live in the base repo, so a gc there could prune one out
       # from under a live checkout. Cheap insurance: the base is scratch we
       # refetch anyway, and nothing else depends on it staying packed.
       git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
-      git clone --quiet --reference-if-able "$base" "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 \
-        || git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
-    else
-      git clone --quiet "https://github.com/$slug.git" "$dir" >/dev/null 2>&1 || return 1
+      if git clone --quiet --shared --no-checkout "$base" "$dir" 2>"$cerr"; then
+        git -C "$dir" remote set-url origin "https://github.com/$slug.git" 2>/dev/null
+      else
+        # Say why. Suppressing this is what made an hour of full-cloning look
+        # like a hang with no cause anywhere in the log.
+        log "  local clone from $base failed: $(head -c 200 "$cerr" 2>/dev/null)"
+        rm -rf "$dir"
+      fi
     fi
+    if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+      git clone --quiet "https://github.com/$slug.git" "$dir" 2>"$cerr" || {
+        log "  clone failed: $(head -c 200 "$cerr" 2>/dev/null)"; rm -f "$cerr"; return 1; }
+    fi
+    rm -f "$cerr"
   fi
+  # The base can be weeks stale, so this fetch is what makes the shared clone
+  # current. It is a delta, not a repository.
   git -C "$dir" fetch --quiet origin >/dev/null 2>&1 || return 1
   git -C "$dir" reset --hard --quiet >/dev/null 2>&1
   git -C "$dir" clean -ffd >/dev/null 2>&1

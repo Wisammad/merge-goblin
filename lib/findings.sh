@@ -90,13 +90,22 @@ findings_verdict() {
 findings_review_event() {
   local file="$1" author="${2:-}" reviewer="${3:-}" event
   event="$(findings_verdict "$file")"
-  if [ -n "$author" ] && [ -n "$reviewer" ] \
-     && [ "$(lc "$author")" = "$(lc "$reviewer")" ] \
-     && [ "$event" != "COMMENT" ]; then
-    printf 'COMMENT\n'
-  else
-    printf '%s\n' "$event"
+  [ "$event" = "COMMENT" ] && { printf 'COMMENT\n'; return 0; }
+
+  # An author we could not read is NOT evidence that somebody else wrote the PR.
+  # GitHub refuses REQUEST_CHANGES on your own pull request with a bare 422, so
+  # reading an empty author as "not mine" loses the entire review -- which is how
+  # two findings, one of them a blocker, went nowhere on #1955 while the very
+  # same run posted fine on a PR whose author had been read. COMMENT says
+  # everything REQUEST_CHANGES says; it just does not block the merge. Guessing
+  # the other way costs the whole review, so guess this way.
+  if [ -z "$author" ] || [ -z "$reviewer" ]; then
+    printf 'COMMENT\n'; return 0
   fi
+  if [ "$(lc "$author")" = "$(lc "$reviewer")" ]; then
+    printf 'COMMENT\n'; return 0
+  fi
+  printf '%s\n' "$event"
 }
 
 # The model subprocess runs a third-party CLI with an untrusted PR checkout as
