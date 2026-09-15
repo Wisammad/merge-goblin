@@ -899,11 +899,15 @@ engine_review_pr() {
   [ "$DRY_RUN" != true ] && gh_status "$slug" "$head" pending "selecting independent reviewers"
 
   # 1. the diff, from GitHub (source of truth for what is commentable)
-  if ! diff_fetch_files "$slug" "$pr" "$work/files.json"; then
-    log "  #$pr: no files returned"
-    engine_pass_write "GitHub returned no changed files"
-    rm -rf "$work"; return 1
-  fi
+  diff_fetch_files "$slug" "$pr" "$work/files.json"
+  case $? in
+    1) log "  #$pr: GitHub reports no changed files"
+       engine_pass_write "GitHub returned no changed files"
+       rm -rf "$work"; return 1 ;;
+    2) log "  #$pr: could not read the changed files from GitHub${GOBLIN_FETCH_ERR:+ — $GOBLIN_FETCH_ERR}"
+       engine_pass_write "could not read the changed files from GitHub"
+       rm -rf "$work"; return 1 ;;
+  esac
   diff_addressable "$work/files.json" "$work/addr.json"
   diff_annotated  "$work/files.json" "$work/diff.txt" "$(cfg_get '.maxDiffBytes' 400000)"
 
@@ -1136,7 +1140,7 @@ engine_checkout() {
     # An isolated checkout was a full clone straight from GitHub: 771MB and
     # minutes on this repo, per run, while an identical copy sat unused in
     # repos/. Four concurrent sweeps meant 3.2GB of scratch and four simultaneous
-    # downloads of the same objects. With the reference it is 3.3MB and seconds.
+    # downloads of the same objects. Measured after: 0.17s and 108KB.
     #
     # Clone from the base on DISK, then point origin back at GitHub. Not
     # `--reference <base> <url>`: that still negotiates the whole repository with
@@ -1154,16 +1158,20 @@ engine_checkout() {
       # from under a live checkout. Cheap insurance: the base is scratch we
       # refetch anyway, and nothing else depends on it staying packed.
       git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
-      if git clone --quiet --shared --no-checkout "$base" "$dir" 2>"$cerr"; then
-        git -C "$dir" remote set-url origin "https://github.com/$slug.git" 2>/dev/null
-      else
-        # Say why. Suppressing this is what made an hour of full-cloning look
-        # like a hang with no cause anywhere in the log.
-        log "  local clone from $base failed: $(head -c 200 "$cerr" 2>/dev/null)"
-        rm -rf "$dir"
+      # No fallback here on purpose. A base that exists but cannot be cloned
+      # from is a real fault — a corrupt repo, a full disk, a permission — and
+      # answering it with a 737MB download is exactly what turned one broken
+      # transfer into an hour of saturated link and more broken transfers. Fail,
+      # say why, and let the next run retry a cheap local clone.
+      if ! git clone --quiet --shared --no-checkout "$base" "$dir" 2>"$cerr"; then
+        log "  clone from the local base failed: $(head -c 200 "$cerr" 2>/dev/null)"
+        log "  (base: $base — check it with: git -C \"$base\" fsck)"
+        rm -rf "$dir"; rm -f "$cerr"; return 1
       fi
-    fi
-    if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+      git -C "$dir" remote set-url origin "https://github.com/$slug.git" 2>/dev/null
+    else
+      # Only when there is no base at all — a first review of a new repo.
+      log "  no local base for $slug yet — cloning it once from GitHub"
       git clone --quiet "https://github.com/$slug.git" "$dir" 2>"$cerr" || {
         log "  clone failed: $(head -c 200 "$cerr" 2>/dev/null)"; rm -f "$cerr"; return 1; }
     fi
@@ -1171,9 +1179,22 @@ engine_checkout() {
   fi
   # The base can be weeks stale, so this fetch is what makes the shared clone
   # current. It is a delta, not a repository.
-  git -C "$dir" fetch --quiet origin >/dev/null 2>&1 || return 1
+  # Both of these used to fail mutely, and the caller then reported the generic
+  # "no local checkout (reviewing from diff only)" — a review silently downgraded
+  # to a worse one, with the reason nowhere in the log.
+  # Not derived from $cerr: that is only assigned on the clone path, and this
+  # runs on the reuse path too, where it would resolve to a stray "./.fetch".
+  local ferr="${RUNTMP:-/tmp}/.fetch-err-$$"
+  if ! git -C "$dir" fetch --quiet origin 2>"$ferr"; then
+    log "  fetch failed in $dir: $(head -c 200 "$ferr" 2>/dev/null)"
+    rm -f "$ferr"; return 1
+  fi
   git -C "$dir" reset --hard --quiet >/dev/null 2>&1
   git -C "$dir" clean -ffd >/dev/null 2>&1
-  ( cd "$dir" && gh pr checkout "$pr" --repo "$slug" --detach >/dev/null 2>&1 ) || return 1
+  if ! ( cd "$dir" && gh pr checkout "$pr" --repo "$slug" --detach 2>"$ferr" ); then
+    log "  gh pr checkout $pr failed: $(head -c 200 "$ferr" 2>/dev/null)"
+    rm -f "$ferr"; return 1
+  fi
+  rm -f "$ferr"
   return 0
 }

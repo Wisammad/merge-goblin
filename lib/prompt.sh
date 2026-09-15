@@ -181,10 +181,18 @@ prompt_build() {
   # every `head -c` — the first attempt at this fixed three of eight sites and
   # #1883 kept failing at a new offset. Anything that slips through is repaired
   # once, here, where the file is finished.
-  if command -v iconv >/dev/null 2>&1; then
-    if ! iconv -f UTF-8 -t UTF-8 "$out" >/dev/null 2>&1; then
-      iconv -f UTF-8 -t UTF-8 -c "$out" > "$out.utf8" 2>/dev/null \
-        && mv "$out.utf8" "$out"
-    fi
+  if ! command -v iconv >/dev/null 2>&1; then
+    log "  WARNING: iconv missing — the prompt cannot be checked for the invalid" >&2
+    log "  UTF-8 that makes codex reject an entire review. Install iconv." >&2
+  elif ! iconv -f UTF-8 -t UTF-8 "$out" >/dev/null 2>&1; then
+    # Repair so one stray byte does not cost the review, but say so every single
+    # time and name the offset: reaching this means a truncation upstream is
+    # still cutting characters in half, and a silent repair is how that stays
+    # broken forever. This should be zero in a healthy run.
+    local off
+    off="$(iconv -f UTF-8 -t UTF-8 "$out" 2>&1 >/dev/null | head -1)"
+    log "  WARNING: prompt contained invalid UTF-8 and was repaired (${off:-unknown position})." >&2
+    log "  A truncation upstream is cutting a character in half — this is a BUG, not a state." >&2
+    iconv -f UTF-8 -t UTF-8 -c "$out" > "$out.utf8" 2>/dev/null && mv "$out.utf8" "$out"
   fi
 }

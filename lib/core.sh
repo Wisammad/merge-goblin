@@ -222,7 +222,14 @@ trunc() { printf '%s' "$1" | cut -c "1-$2"; }
 head_bytes_utf8() {   # <max-bytes>   stdin -> stdout
   if command -v iconv >/dev/null 2>&1; then
     head -c "$1" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null
-  else
-    head -c "$1"
+    return 0
   fi
+  # No iconv: this is the OLD, broken behaviour, so do not let it pass for the
+  # safe one. Once per process is enough to be heard without drowning the log.
+  if [ -z "${GOBLIN_NO_ICONV_WARNED:-}" ]; then
+    GOBLIN_NO_ICONV_WARNED=1
+    log "  WARNING: iconv not found — truncations can cut a UTF-8 character in half," >&2
+    log "  which makes codex reject an entire prompt. Install iconv." >&2
+  fi
+  head -c "$1"
 }

@@ -13,15 +13,34 @@
 # diff_fetch_files <slug> <pr> <out.json>
 # GitHub's files payload is the source of truth for what is addressable — the
 # local checkout can legitimately differ from what GitHub thinks the diff is.
+# diff_fetch_files <slug> <pr> <out>
+#   0 — files written
+#   1 — GitHub answered, and the PR really has no changed files
+#   2 — could not ask; GitHub_FETCH_ERR carries why
+#
+# These used to be one branch: the gh error went to /dev/null and any empty
+# result became "GitHub returned no changed files", which ABORTS the sweep. An
+# open PR with genuinely zero changed files barely happens; a blipping API call
+# happens all the time, and #1970 was stopped at pass 2 of 5 by one while the PR
+# had a changed file the API served on the next request.
 diff_fetch_files() {
-  local slug="$1" pr="$2" out="$3"
-  gh api --paginate "repos/$slug/pulls/$pr/files?per_page=100" \
-    --jq '.[] | {filename, status, additions, deletions, patch}' 2>/dev/null \
-    | jq -s '.' > "$out" 2>/dev/null
-  if ! jq -e 'type == "array" and length > 0' "$out" >/dev/null 2>&1; then
-    echo '[]' > "$out"; return 1
-  fi
-  return 0
+  local slug="$1" pr="$2" out="$3" raw="$3.raw" err="$3.err" i=0
+  GOBLIN_FETCH_ERR=""
+  while [ "$i" -lt 3 ]; do
+    if gh api --paginate "repos/$slug/pulls/$pr/files?per_page=100" \
+         --jq '.[] | {filename, status, additions, deletions, patch}' > "$raw" 2>"$err"; then
+      jq -s '.' < "$raw" > "$out" 2>/dev/null || echo '[]' > "$out"
+      if jq -e 'type == "array" and length > 0' "$out" >/dev/null 2>&1; then
+        rm -f "$raw" "$err"; return 0
+      fi
+      # gh succeeded and reported nothing: that is an answer, not a blip.
+      echo '[]' > "$out"; rm -f "$raw" "$err"; return 1
+    fi
+    GOBLIN_FETCH_ERR="$(head -c 200 "$err" 2>/dev/null)"
+    i=$((i + 1)); [ "$i" -lt 3 ] && sleep 2
+  done
+  echo '[]' > "$out"; rm -f "$raw" "$err"
+  return 2
 }
 
 diff_addressable() { jq -f "$SHARE_DIR/jq/addressable.jq" "$1" > "$2"; }
