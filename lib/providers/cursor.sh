@@ -102,8 +102,16 @@ provider_cursor_review() {
 
   if [ "$rc" = "124" ]; then GOBLIN_P_ERRKIND=timeout; GOBLIN_P_ERRMSG="timed out after ${to}s"; return 124; fi
   if [ "$rc" != "0" ]; then
-    GOBLIN_P_ERRKIND="$(provider_classify_error "$(cat "$raw/stderr.txt" 2>/dev/null)")"
-    GOBLIN_P_ERRMSG="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"
+    local cu_msg
+    cu_msg="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"
+    [ -z "$cu_msg" ] && cu_msg="$(jq -rs '[.[]? | (.error.message // .message // empty)] | last // empty' \
+                                    "$raw/stdout.json" 2>/dev/null)"
+    # Both streams empty is itself the finding. It used to classify as "other"
+    # with an empty message, which the caller rendered as the placeholder
+    # "review failed" -- a reviewer that vanished, described as nothing at all.
+    [ -z "$cu_msg" ] && cu_msg="cursor-agent exited $rc with no output on stdout or stderr"
+    GOBLIN_P_ERRKIND="$(provider_classify_error "$cu_msg")"
+    GOBLIN_P_ERRMSG="$(printf '%s' "$cu_msg" | head -c 300)"
     return 1
   fi
 

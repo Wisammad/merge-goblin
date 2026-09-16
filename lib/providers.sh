@@ -18,7 +18,13 @@ provider_classify_error() {
   local t; t="$(lc "${1:-}")"
   case "$t" in
     *"rate limit"*|*"quota"*|*"usage limit"*|*"too many requests"*|*429*) echo quota ;;
+    *"out of usage"*|*"actionrequired"*|*"increase limits"*|*"increase your limit"*) echo quota ;;
+    # A spend cap is a quota. Codex words it "You hit your spend cap set by the
+    # owner of your workspace. Ask an owner to increase your spend cap", which
+    # matched none of the above and landed in `other`.
+    *"spend cap"*|*"spending limit"*|*"billing"*|*"credit balance"*|*"insufficient funds"*) echo quota ;;
     *"not logged in"*|*"unauthorized"*|*"authentication"*|*"invalid api key"*|*401*) echo auth ;;
+    *"hastrustdialogaccepted"*|*"workspace has not been trusted"*|*"not been trusted"*) echo setup ;;
     *"timeout"*|*"timed out"*|*"econnreset"*|*"network"*|*"socket"*|*5[0-9][0-9]*) echo transient ;;
     "") echo other ;;
     *) echo other ;;

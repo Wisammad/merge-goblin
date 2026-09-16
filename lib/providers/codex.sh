@@ -79,8 +79,20 @@ provider_codex_review() {
 
   if [ "$rc" = "124" ]; then GOBLIN_P_ERRKIND=timeout; GOBLIN_P_ERRMSG="timed out after ${to}s"; return 124; fi
   if [ "$rc" != "0" ]; then
-    GOBLIN_P_ERRKIND="$(provider_classify_error "$(cat "$raw/stderr.txt" 2>/dev/null)")"
-    GOBLIN_P_ERRMSG="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"
+    # Codex reports the real failure as a JSON event on STDOUT; stderr carries
+    # unrelated noise. Reading stderr alone told the operator "failed to refresh
+    # available models: timeout waiting for child process to exit" when what had
+    # actually happened was "You hit your spend cap set by the owner of your
+    # workspace" -- a different problem with a different fix, and the actionable
+    # sentence was on disk the whole time. Prefer stdout, fall back to stderr.
+    local cx_msg
+    cx_msg="$(jq -rs '[.[]? | select(.type=="error" or .type=="turn.failed")
+                        | (.message // .error.message // empty)] | last // empty' \
+                "$raw/stdout.jsonl" 2>/dev/null)"
+    [ -z "$cx_msg" ] && cx_msg="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"
+    [ -z "$cx_msg" ] && cx_msg="codex exited $rc with no output"
+    GOBLIN_P_ERRKIND="$(provider_classify_error "$cx_msg")"
+    GOBLIN_P_ERRMSG="$(printf '%s' "$cx_msg" | head -c 300)"
     return 1
   fi
 
