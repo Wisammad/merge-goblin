@@ -1725,11 +1725,12 @@ test_sweep_honours_the_pass_cap() (
   # reviews: every pass spends a maxReviewsPerDay slot and real provider money.
   sweep_script 1 1 1 1 1 1 1 1
   cfg_set '.maxPassesPerPr = 3'
-  engine_sweep acme/repo 42 >/dev/null && return 1
+  # Reaching the cap is a result, not a failure (da6e06f): it exits 0.
+  engine_sweep acme/repo 42 >/dev/null || return 1
   eq "3" "$(sweep_passes)" || return 1
   # An explicit --max-passes overrides the configured ceiling.
   : > "$GOBLIN_HOME/sweep-passes"
-  engine_sweep acme/repo 42 2 >/dev/null && return 1
+  engine_sweep acme/repo 42 2 >/dev/null || return 1
   eq "2" "$(sweep_passes)" || return 1
   teardown
 )
