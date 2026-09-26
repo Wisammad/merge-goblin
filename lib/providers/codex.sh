@@ -40,11 +40,10 @@ provider_codex_probe() {
 
 provider_codex_review() {
   local pf="$1" dir="$2" schema="$3" out="$4" raw="$5"
-  local bin model eff to t0 rc=0
+  local bin model eff t0 rc=0
   bin="$(provider_codex_bin)" || { GOBLIN_P_ERRKIND=other; GOBLIN_P_ERRMSG="codex not found"; return 1; }
   model="$(cfg_get '.providers.codex.model' '')"
   eff="$(cfg_get '.providers.codex.reasoningEffort' 'medium')"
-  to="$(cfg_get '.timeoutSecs' 900)"
   t0="$(now_epoch)"
 
   # OpenAI's structured-output dialect is stricter than JSON Schema: every
@@ -65,7 +64,7 @@ provider_codex_review() {
 
   # `codex exec -` reads the prompt from stdin, which avoids both argv length
   # limits on large diffs and any flag/positional ambiguity.
-  run_with_timeout "$to" "$bin" "$@" - \
+  "$bin" "$@" - \
     > "$raw/stdout.jsonl" 2> "$raw/stderr.txt" < "$pf" || rc=$?
 
   GOBLIN_P_DURATION_MS=$(( ($(now_epoch) - t0) * 1000 ))
@@ -77,7 +76,6 @@ provider_codex_review() {
   GOBLIN_P_TOKENS_OUT="$(jq -rs '[.[]? | .. | objects | .output_tokens? // empty] | last // 0' "$raw/stdout.jsonl" 2>/dev/null)"
   GOBLIN_P_TURNS=0
 
-  if [ "$rc" = "124" ]; then GOBLIN_P_ERRKIND=timeout; GOBLIN_P_ERRMSG="timed out after ${to}s"; return 124; fi
   if [ "$rc" != "0" ]; then
     # Codex reports the real failure as a JSON event on STDOUT; stderr carries
     # unrelated noise. Reading stderr alone told the operator "failed to refresh

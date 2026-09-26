@@ -106,7 +106,7 @@ reservation_try() {
     # fail (disk full, permissions), and reporting success while
     # reservations.json was never actually updated would let the caller
     # proceed believing it holds a slot no other process can see.
-    if jq --arg id "$id" --argjson at "$(now_epoch)" '.[$id] = {at:$at}' "$f" > "$f.tmp" 2>/dev/null \
+    if jq --arg id "$id" --argjson at "$(now_epoch)" --argjson pid "$$" '.[$id] = {at:$at,pid:$pid}' "$f" > "$f.tmp" 2>/dev/null \
          && mv "$f.tmp" "$f"; then
       RESERVATION_ID="$id"
       ok=true
@@ -133,17 +133,21 @@ reservation_release() {
   return 0
 }
 
-# reservation_count — live reservations. One older than goblin_max_review_secs
-# is treated as abandoned by a process that crashed before releasing it — a
-# fixed window here would, at a long configured timeoutSecs, expire the
-# reservation for a review that is still legitimately running and let a
-# second audit through, exactly the overrun this mechanism exists to prevent.
+# Reservations remain live as long as their owner does. Age is only used for
+# legacy records written before owner PIDs were recorded.
 reservation_count() {
-  local f="$RESERVATIONS" out cutoff
+  local f="$RESERVATIONS" out cutoff pid live='[]'
   [ -s "$f" ] || { printf '0'; return 0; }
   cutoff=$(( $(now_epoch) - $(goblin_max_review_secs) ))
-  out="$(jq -r --argjson cutoff "$cutoff" \
-    '[to_entries[] | select((.value.at // 0) >= $cutoff)] | length' "$f" 2>/dev/null)"
+  for pid in $(jq -r '[.[] | .pid // empty] | unique[]' "$f" 2>/dev/null); do
+    case "$pid" in ''|*[!0-9]*|0) continue ;; esac
+    if kill -0 "$pid" 2>/dev/null; then
+      live="$(printf '%s' "$live" | jq --argjson pid "$pid" '. + [$pid]')"
+    fi
+  done
+  out="$(jq -r --argjson cutoff "$cutoff" --argjson live "$live" \
+    '[.[] | select(if .pid then .pid as $p | $live | index($p) != null
+                  else (.at // 0) >= $cutoff end)] | length' "$f" 2>/dev/null)"
   if [ -n "$out" ]; then printf '%s' "$out"; else printf '0'; fi
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# core.sh — logging, time, notifications, and the timeout watchdog.
+# core.sh — logging, time, notifications, and process locks.
 # Written for bash 3.2 (what /bin/bash on macOS actually is): no associative
 # arrays, no mapfile, no ${var,,}.
 
@@ -45,50 +45,8 @@ end run"
   printf '%s' "$script" | osascript - "$title" "$message" >/dev/null 2>&1 || true
 }
 
-# run_with_timeout <secs> <cmd...>
-# macOS ships no timeout(1)/gtimeout, and a hung model call would otherwise wedge
-# the whole run until the 3h stale-lock sweep. Returns 124 on timeout, else the
-# child's exit code.
-run_with_timeout() {
-  local secs="$1"; shift
-  # `<&0` is load-bearing: POSIX says an asynchronous command's stdin is assigned
-  # to /dev/null unless explicitly redirected, which would silently swallow a
-  # prompt the caller piped in. This passes the caller's stdin through.
-  "$@" <&0 &
-  local child=$!
-  (
-    local waited=0
-    while [ "$waited" -lt "$secs" ]; do
-      kill -0 "$child" 2>/dev/null || exit 0
-      sleep 1
-      waited=$((waited + 1))
-    done
-    # grace, then force
-    kill -TERM "$child" 2>/dev/null
-    sleep 5
-    kill -KILL "$child" 2>/dev/null
-  ) &
-  local watcher=$!
-  local rc=0
-  wait "$child" 2>/dev/null || rc=$?
-  # If the watcher already exited, the child finished on its own.
-  if kill -0 "$watcher" 2>/dev/null; then
-    kill "$watcher" 2>/dev/null
-    wait "$watcher" 2>/dev/null || true
-  else
-    [ "$rc" -ne 0 ] && rc=124
-  fi
-  return "$rc"
-}
-
-# goblin_max_review_secs — the longest one review can legitimately still be
-# running: findings_run makes at most one repair retry, so a single reviewer
-# can take up to 2x the configured per-call timeout, plus overhead for
-# checkout/diff/posting. timeoutSecs is user-configurable up to 7200s, so
-# this is not a constant — anything that treats a review as "abandoned"
-# after a fixed window (a stale PR lock, an expired reservation) must derive
-# that window from this, or a review legitimately using a long configured
-# timeout gets mistaken for a crashed one partway through.
+# Compatibility window for old locks/reservations with no recorded owner.
+# Current reviews have no deadline; their owner's lifetime protects them.
 goblin_max_review_secs() {
   local to=900
   command -v cfg_get >/dev/null 2>&1 && to="$(cfg_get '.timeoutSecs' 900)"
@@ -102,7 +60,7 @@ goblin_max_review_secs() {
 lock_acquire() {
   local dir="${1:-$LOCKDIR}" stale_mins="${2:-180}"
   if [ -d "$dir" ]; then
-    if [ -n "$(find "$dir" -maxdepth 0 -mmin +"$stale_mins" 2>/dev/null)" ]; then
+    if lock_is_stale "$dir" "$stale_mins"; then
       log "removing stale lock"
       rmdir "$dir" 2>/dev/null || rm -rf "$dir"
     else
@@ -110,18 +68,29 @@ lock_acquire() {
     fi
   fi
   mkdir "$dir" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$dir/owner"
   return 0
 }
-lock_release() { rmdir "${1:-$LOCKDIR}" 2>/dev/null || true; }
+lock_release() {
+  rm -f "${1:-$LOCKDIR}/owner" 2>/dev/null
+  rmdir "${1:-$LOCKDIR}" 2>/dev/null || true
+}
+
+lock_is_stale() {
+  local dir="$1" mins="$2" owner
+  owner="$(cat "$dir/owner" 2>/dev/null)"
+  case "$owner" in
+    ''|*[!0-9]*|0) ;; # Legacy lock, or interrupted before writing its owner.
+    *) kill -0 "$owner" 2>/dev/null && return 1; return 0 ;;
+  esac
+  [ -n "$(find "$dir" -maxdepth 0 -mmin +"$mins" 2>/dev/null)" ]
+}
 
 # Exact-PR audits can run together, but never twice for the same PR. The global
 # run lock still serializes scheduled and repo-wide scans.
 #
-# The shared 3h default assumed the single-attempt review this feature
-# replaced; at the maximum configured timeoutSecs plus a repair retry, one
-# review can legitimately run close to 4 hours, which a fixed 3h staleness
-# window would treat as abandoned and hand to a second, concurrent audit —
-# the exact duplicate-review-and-post this lock exists to prevent.
+# Owner liveness protects a review for as long as the Goblin process runs.
+# The age window applies only to locks left by older installations.
 #
 # Initialised here, and read with a default below, because pr_lock_release runs
 # from the engine's EXIT trap — including on the paths that return before any PR
@@ -147,7 +116,7 @@ pr_lock_busy() {
   local dir="$PR_LOCKS_DIR/$(goblin_hash "$1#$2")" stale_mins
   [ -d "$dir" ] || return 1
   stale_mins="$(( $(goblin_max_review_secs) / 60 ))"
-  [ -n "$(find "$dir" -maxdepth 0 -mmin +"$stale_mins" 2>/dev/null)" ] && return 1
+  lock_is_stale "$dir" "$stale_mins" && return 1
   return 0
 }
 

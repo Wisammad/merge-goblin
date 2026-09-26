@@ -11,6 +11,10 @@ two agents then review independently in parallel, and the GitHub review names th
 signal and both reviewer/model routes. With no recognized signature, the fallback is Claude
 Opus 5 plus the configured companion provider (OpenAI Codex by default).
 
+Reviews have no time limit: Goblin waits until the provider finishes, fails, or
+you stop the run. An active audit keeps its local lock and budget reservation
+regardless of how long it takes. The old `timeoutSecs` setting no longer limits reviews.
+
 > ### The Goblin refuses the merge.
 > `claude/sonnet` · inspected `aa309fb` — 12 files, +1976 −296 against `main`
 >

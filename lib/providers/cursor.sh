@@ -53,11 +53,11 @@ provider_cursor_probe() {
             else "run: cursor-agent login" end)}'
 }
 
-# provider_cursor_invoke <bin> <dir> <timeout> <prompt> <raw> [model]
+# provider_cursor_invoke <bin> <dir> <prompt> <raw> [model]
 # One `cursor-agent -p` call. Split out so the caller can make it twice — see
 # the model fallback below.
 provider_cursor_invoke() {
-  local bin="$1" dir="$2" to="$3" pf="$4" raw="$5" model="${6:-}" rc=0
+  local bin="$1" dir="$2" pf="$3" raw="$4" model="${5:-}" rc=0
   # cursor-agent refuses to run in an untrusted directory and asks interactively,
   # which never completes under launchd. --force trusts the directory; safe here
   # because the review needs read access only — it has no tools to post with and
@@ -66,7 +66,7 @@ provider_cursor_invoke() {
   [ -n "$model" ] && set -- "$@" --model "$model"
 
   ( cd "$dir" 2>/dev/null || exit 1
-    run_with_timeout "$to" "$bin" "$@" \
+    "$bin" "$@" \
       > "$raw/stdout.json" 2> "$raw/stderr.txt" < "$pf"
   ) || rc=$?
   return "$rc"
@@ -74,13 +74,12 @@ provider_cursor_invoke() {
 
 provider_cursor_review() {
   local pf="$1" dir="$2" schema="$3" out="$4" raw="$5"
-  local bin model to t0 rc=0
+  local bin model t0 rc=0
   bin="$(provider_cursor_bin)" || { GOBLIN_P_ERRKIND=other; GOBLIN_P_ERRMSG="cursor-agent not found"; return 1; }
   model="${GOBLIN_MODEL_OVERRIDE:-$(cfg_get '.providers.cursor.model' '')}"
-  to="$(cfg_get '.timeoutSecs' 900)"
   t0="$(now_epoch)"
 
-  provider_cursor_invoke "$bin" "$dir" "$to" "$pf" "$raw" "$model" || rc=$?
+  provider_cursor_invoke "$bin" "$dir" "$pf" "$raw" "$model" || rc=$?
 
   # A model id this cursor-agent build does not know is a hard, immediate refusal
   # ("Cannot use this model: X. Available models: ..."), not a review that failed.
@@ -92,7 +91,7 @@ provider_cursor_review() {
      && grep -qi 'cannot use this model' "$raw/stderr.txt" 2>/dev/null; then
     log "  cursor-agent does not know '$model' — retrying with its own default model"
     model=""; rc=0
-    provider_cursor_invoke "$bin" "$dir" "$to" "$pf" "$raw" "" || rc=$?
+    provider_cursor_invoke "$bin" "$dir" "$pf" "$raw" "" || rc=$?
   fi
 
   GOBLIN_P_DURATION_MS=$(( ($(now_epoch) - t0) * 1000 ))
@@ -100,7 +99,6 @@ provider_cursor_review() {
   GOBLIN_P_COST_KNOWN=false; GOBLIN_P_COST_USD=0
   GOBLIN_P_TOKENS_IN=0; GOBLIN_P_TOKENS_OUT=0; GOBLIN_P_TURNS=0
 
-  if [ "$rc" = "124" ]; then GOBLIN_P_ERRKIND=timeout; GOBLIN_P_ERRMSG="timed out after ${to}s"; return 124; fi
   if [ "$rc" != "0" ]; then
     local cu_msg
     cu_msg="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"

@@ -47,10 +47,9 @@ provider_claude_probe() {
 # provider_claude_review <prompt_file> <repo_dir> <schema> <out_json> <raw_dir>
 provider_claude_review() {
   local pf="$1" dir="$2" schema="$3" out="$4" raw="$5"
-  local bin model to t0 rc=0
+  local bin model t0 rc=0
   bin="$(provider_claude_bin)" || { GOBLIN_P_ERRKIND=other; GOBLIN_P_ERRMSG="claude not found"; return 1; }
   model="${GOBLIN_MODEL_OVERRIDE:-$(cfg_get '.providers.claude.model' 'sonnet')}"
-  to="$(cfg_get '.timeoutSecs' 900)"
   t0="$(now_epoch)"
 
   # --tools "" removes all tool access: with the model no longer posting, it only
@@ -61,7 +60,7 @@ provider_claude_review() {
   # either through stdin or as a prompt argument"). Redirecting from the prompt
   # file also keeps `claude -p`'s stdin drain away from the engine's PR loop.
   ( cd "$dir" 2>/dev/null || exit 1
-    run_with_timeout "$to" "$bin" -p \
+    "$bin" -p \
       --model "$model" \
       --output-format json \
       --json-schema "$(cat "$schema")" \
@@ -78,9 +77,6 @@ provider_claude_review() {
   GOBLIN_P_TOKENS_OUT="$(jq -r '.usage.output_tokens // 0' "$raw/stdout.json" 2>/dev/null)"
   GOBLIN_P_TURNS="$(jq -r '.num_turns // 0' "$raw/stdout.json" 2>/dev/null)"
 
-  if [ "$rc" = "124" ]; then
-    GOBLIN_P_ERRKIND=timeout; GOBLIN_P_ERRMSG="timed out after ${to}s"; return 124
-  fi
   if [ "$rc" != "0" ]; then
     GOBLIN_P_ERRKIND="$(provider_classify_error "$(cat "$raw/stderr.txt" 2>/dev/null)")"
     GOBLIN_P_ERRMSG="$(head -c 300 "$raw/stderr.txt" 2>/dev/null)"

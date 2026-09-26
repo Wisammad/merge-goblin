@@ -45,6 +45,67 @@ setup() {
 }
 teardown() { [ -n "${GOBLIN_HOME:-}" ] && [ -d "$GOBLIN_HOME" ] && rm -rf "$GOBLIN_HOME"; }
 
+test_reviews_have_no_deadline() (
+  setup
+  trap teardown EXIT
+  . "$ROOT/lib/providers.sh"; providers_load
+  . "$ROOT/lib/findings.sh"
+  cfg_set '.timeoutSecs = 1'
+  local fake="$GOBLIN_HOME/reviewer" raw="$GOBLIN_HOME/raw" p
+  mkdir -p "$raw"
+  printf 'review input' > "$GOBLIN_HOME/prompt"
+  printf '{}' > "$GOBLIN_HOME/schema"
+  cat > "$fake" <<'SH'
+#!/usr/bin/env bash
+last=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output-last-message ]; then shift; last="$1"; fi
+  shift
+done
+[ "$(cat)" = 'review input' ] || exit 9
+sleep 2
+if [ "${FAKE_REVIEW_FAIL:-0}" = 1 ]; then echo 'quota exhausted' >&2; exit 1; fi
+[ -z "$last" ] || printf '{"findings":[]}' > "$last"
+printf '%s\n' '{"structured_output":{"findings":[]},"result":"{\"findings\":[]}"}'
+SH
+  chmod +x "$fake"
+  provider_claude_bin() { printf '%s' "$fake"; }
+  provider_codex_bin() { printf '%s' "$fake"; }
+  provider_cursor_bin() { printf '%s' "$fake"; }
+  for p in claude codex cursor; do
+    "provider_${p}_review" "$GOBLIN_HOME/prompt" "$GOBLIN_HOME" "$GOBLIN_HOME/schema" "$GOBLIN_HOME/out" "$raw" || return 1
+    jq -e '.findings == []' "$GOBLIN_HOME/out" >/dev/null || return 1
+  done
+  export FAKE_REVIEW_FAIL=1
+  provider_cursor_review "$GOBLIN_HOME/prompt" "$GOBLIN_HOME" '' "$GOBLIN_HOME/out" "$raw" && return 1
+  eq quota "$GOBLIN_P_ERRKIND"
+)
+
+test_live_audits_do_not_expire() (
+  setup
+  trap teardown EXIT
+  goblin_ensure_dirs
+  pr_lock_acquire acme/repo 7 || return 1
+  touch -t "$(date -v-2d '+%Y%m%d%H%M')" "$PR_LOCKDIR"
+  pr_lock_busy acme/repo 7 || return 1
+  ( PR_LOCKDIR=''; pr_lock_acquire acme/repo 7 ) && return 1
+  reservation_try 'acme/repo#7:abc' 1 || return 1
+  jq 'with_entries(.value.at = 1)' "$RESERVATIONS" > "$RESERVATIONS.tmp"
+  mv "$RESERVATIONS.tmp" "$RESERVATIONS"
+  eq 1 "$(reservation_count)" || return 1
+  reservation_try 'acme/repo#8:def' 1 && return 1
+  # An exited owner is reclaimable without waiting for an age threshold.
+  sleep 0 & local dead=$!
+  wait "$dead"
+  printf '%s\n' "$dead" > "$PR_LOCKDIR/owner"
+  pr_lock_busy acme/repo 7 && return 1
+  pr_lock_acquire acme/repo 7 || return 1
+  pr_lock_release
+  jq --argjson pid "$dead" 'with_entries(.value.pid = $pid)' "$RESERVATIONS" > "$RESERVATIONS.tmp"
+  mv "$RESERVATIONS.tmp" "$RESERVATIONS"
+  eq 0 "$(reservation_count)"
+)
+
 # ---------------------------------------------------------------- config ---
 test_config_defaults() {
   setup
@@ -358,6 +419,18 @@ test_findings_extract_prose_on_same_line() {
   printf '%s' 'I will review the diff and return only the findings JSON.{"summary":"s","findings":[]} hope this helps' > "$GOBLIN_HOME/raw.txt"
   findings_extract "$GOBLIN_HOME/raw.txt" "$GOBLIN_HOME/out.json" || return 1
   eq "s" "$(jq -r '.summary' "$GOBLIN_HOME/out.json")" || return 1
+  teardown
+}
+
+test_findings_extract_stray_trailing_brace() {
+  # Regression (#2177): a complete review followed by one extra "}" made the
+  # widest brace span invalid, so a good cursor review was rejected twice.
+  setup
+  . "$ROOT/lib/findings.sh"
+  printf '%s\n}\n' 'I will review the diff.{"summary":"s","findings":[{"title":"t"}]}' > "$GOBLIN_HOME/raw.txt"
+  findings_extract "$GOBLIN_HOME/raw.txt" "$GOBLIN_HOME/out.json" || return 1
+  eq "s" "$(jq -r '.summary' "$GOBLIN_HOME/out.json")" || return 1
+  eq "1" "$(jq '.findings | length' "$GOBLIN_HOME/out.json")" || return 1
   teardown
 }
 
@@ -725,6 +798,50 @@ JSON
     && { echo "merge published a review with no reviewer output"; return 1; }
   teardown
 )
+
+test_reviewers_fallback_to_spare_provider() (
+  setup
+  . "$ROOT/lib/providers.sh"
+  . "$ROOT/lib/reviewers.sh"
+  local work="$GOBLIN_HOME/work"; mkdir -p "$work"
+  provider_claude_probe()  { echo '{"available":true,"authed":true}'; }
+  provider_codex_probe()   { echo '{"available":true,"authed":true}'; }
+  provider_cursor_probe()  { echo '{"available":true,"authed":true}'; }
+  findings_run() {
+    local p="$1" out="$4"
+    case "$p" in
+      codex)
+        printf '{"summary":"codex spare","findings":[{"id":"x","severity":"risk","title":"Spare worked","body":"codex","path":"a.ts","line":1}],"intent_note":null}\n' > "$out"
+        GOBLIN_P_MODEL="codex-model"; GOBLIN_P_COST_USD=0; GOBLIN_P_DURATION_MS=5
+        return 0
+        ;;
+      *)
+        GOBLIN_P_ERRKIND=quota
+        GOBLIN_P_ERRMSG="out of usage"
+        return 1
+        ;;
+    esac
+  }
+  cat > "$work/plan.json" <<'JSON'
+{"contributor":{"detected":false,"provider":"","label":"","matches":0,"signal":""},"contributors":[],"independent":true,"note":"","reviewers":[{"provider":"claude","label":"Claude Opus 5","modelOverride":"opus"},{"provider":"cursor","label":"Cursor","modelOverride":""}]}
+JSON
+  reviewers_run "$work/plan.json" "$work/prompt" "$work" "$work" \
+    || { echo "spare provider was not tried after planned reviewers failed"; return 1; }
+  reviewers_merge "$work/plan.json" "$work" "$work/merged.json" "$work/final.json" \
+    || { echo "merge did not accept spare reviewer output"; return 1; }
+  eq "codex" "$(jq -r '.findings[0].reviewers[0].provider' "$work/merged.json")" || return 1
+  jq -e '.reviewers[] | select(.provider == "codex" and .spare == true)' "$work/plan.json" >/dev/null \
+    || { echo "spare reviewer was not recorded on the plan"; return 1; }
+  teardown
+)
+
+test_provider_classify_cursor_out_of_usage() {
+  setup
+  . "$ROOT/lib/providers.sh"
+  eq "quota" "$(provider_classify_error "ActionRequiredError: out of usage")" || return 1
+  eq "setup" "$(provider_classify_error "workspace has not been trusted")" || return 1
+  teardown
+}
 
 # ------------------------------------------------------------ assignment ---
 test_assignment_is_deterministic_and_spread() {
@@ -1788,11 +1905,11 @@ test_cursor_falls_back_when_the_cli_rejects_the_model() {
   # cursor-agent older than that id fails with an opaque provider error.
   provider_cursor_bin() { echo /bin/false; }
   provider_cursor_invoke() {
-    printf '%s\n' "${6:-<none>}" >> "$seen"
-    if [ -n "${6:-}" ]; then
-      echo "Cannot use this model: ${6}. Available models: auto" > "$5/stderr.txt"; return 1
+    printf '%s\n' "${5:-<none>}" >> "$seen"
+    if [ -n "${5:-}" ]; then
+      echo "Cannot use this model: ${5}. Available models: auto" > "$4/stderr.txt"; return 1
     fi
-    printf '{"result":"{\\"findings\\":[]}"}' > "$5/stdout.json"; : > "$5/stderr.txt"; return 0
+    printf '{"result":"{\\"findings\\":[]}"}' > "$4/stdout.json"; : > "$4/stderr.txt"; return 0
   }
   : > "$GOBLIN_HOME/prompt"
   provider_cursor_review "$GOBLIN_HOME/prompt" "$GOBLIN_HOME" "" "$GOBLIN_HOME/out.json" "$raw" || return 1
@@ -2464,6 +2581,8 @@ test_app_build_stages_before_swapping() {
 }
 
 printf '\n  goblin test suite\n\n'
+t "reviews: no deadline, real failures preserved" test_reviews_have_no_deadline
+t "reviews: live audits never expire" test_live_audits_do_not_expire
 t "config: defaults"                     test_config_defaults
 t "config: corrupt file recovers"        test_config_corrupt_file_recovers
 t "config: backfill preserves values"    test_config_backfill_preserves_user_values
@@ -2488,6 +2607,7 @@ t "findings: drop inverted range"        test_normalize_drops_inverted_range
 t "findings: verdict clamped"            test_verdict_is_clamped_to_comment
 t "findings: extract from prose"         test_findings_extract_from_fenced_prose
 t "findings: prose on the same line"     test_findings_extract_prose_on_same_line
+t "findings: stray trailing brace"       test_findings_extract_stray_trailing_brace
 t "diff: addressable + split"            test_addressable_and_split
 t "diff: annotate line numbers"          test_annotate_numbers_lines
 t "providers: adapters load in caller shell" test_adapters_are_loaded_in_the_callers_shell
@@ -2502,7 +2622,9 @@ t "reviewers: uses the one available independent reviewer" test_independent_and_
 t "reviewers: no-signature plan respects availability" test_no_signature_plan_still_respects_availability
 t "reviewers: contributor signal strips backticks" test_contributor_signal_strips_backticks
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
+t "reviewers: spare tried when all fail"   test_reviewers_fallback_to_spare_provider
 t "reviewers: zero reviewers still fails"  test_zero_reviewers_is_still_a_failure
+t "providers: classify quota and setup"    test_provider_classify_cursor_out_of_usage
 t "fleet: assignment deterministic"      test_assignment_is_deterministic_and_spread
 t "fleet: empty fleet"                   test_assignment_empty_fleet
 t "agent: label is per-user"             test_agent_label_is_per_user
