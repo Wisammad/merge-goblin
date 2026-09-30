@@ -95,8 +95,8 @@ _panel_set() {
       cfg_set ".intervalSeconds = $((out * 60))"
       echo "interval saved — run '$GOBLIN_SLUG agent reload' (or reinstall) to apply it" ;;
     timeout)
-      out="$(_panel_int "$v" 60 7200)"  || { echo "timeout must be 60-7200 seconds" >&2; return 2; }
-      cfg_set ".timeoutSecs = $out" ;;
+      echo "review timeouts have been removed; reviews run until the provider finishes or you stop them" >&2
+      return 2 ;;
     diff-bytes)
       out="$(_panel_int "$v" 10000 4000000)" || { echo "diff bytes must be 10000-4000000" >&2; return 2; }
       cfg_set ".maxDiffBytes = $out" ;;
