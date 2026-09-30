@@ -1126,6 +1126,40 @@ engine_dry_run() {
   cp -R "$work" "$GOBLIN_HOME/last-dry-run" 2>/dev/null && echo "copy kept at: $GOBLIN_HOME/last-dry-run"
 }
 
+# Bring the shared base up to date before an isolated checkout borrows from it.
+# Nothing else ever fetched the base once scheduled sweeps were off: every
+# isolated checkout fetched into its own throwaway clone, so the base froze
+# (measured 2026-09-30: 16 days stale) and EVERY review re-downloaded the same
+# ~64MB of 16 days of branches over HTTP/2, which broke mid-transfer ("curl 92
+# ... CANCEL") often enough to fail many reviews a day. Fetching here lands the
+# objects once, where every later checkout shares them, so the checkout's own
+# fetch shrinks to the few commits pushed since.
+#
+# One fetch at a time: concurrent sweeps wait on the lock instead of racing the
+# same download (two transfers in flight is what saturated the link before).
+# Best-effort: a failed refresh is logged and the checkout's fetch still runs,
+# so a flaky network costs no more than it did without this.
+engine_base_refresh() {
+  local base="$1" lock err tries=0
+  lock="$STATE_LOCKS_DIR/base-fetch-$(goblin_hash "$base")"
+  mkdir -p "$STATE_LOCKS_DIR" 2>/dev/null
+  while ! lock_acquire "$lock" 20; do
+    tries=$((tries + 1))
+    # Another sweep is fetching the base right now; its result is ours too.
+    [ "$tries" -ge 600 ] && { log "  base refresh: lock still held after 10m, skipping"; return 0; }
+    sleep 1
+  done
+  # Waited behind another fetch: the base is already fresh.
+  if [ "$tries" -gt 0 ]; then lock_release "$lock"; return 0; fi
+  err="${RUNTMP:-/tmp}/.base-fetch-err-$$"
+  if ! git -C "$base" fetch --quiet origin 2>"$err"; then
+    log "  base refresh failed (checkout will fetch itself): $(head -c 200 "$err" 2>/dev/null)"
+  fi
+  rm -f "$err"
+  lock_release "$lock"
+  return 0
+}
+
 # Standalone clone (never a worktree under ~/Documents — macOS TCC blocks
 # launchd from reading there), reset hard before every checkout because leftover
 # dirty files made `gh pr checkout` abort on every PR once.
@@ -1158,6 +1192,7 @@ engine_checkout() {
       # from under a live checkout. Cheap insurance: the base is scratch we
       # refetch anyway, and nothing else depends on it staying packed.
       git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
+      engine_base_refresh "$base"
       # No fallback here on purpose. A base that exists but cannot be cloned
       # from is a real fault — a corrupt repo, a full disk, a permission — and
       # answering it with a 737MB download is exactly what turned one broken
