@@ -27,6 +27,14 @@ findings_extract() {
     "$src" > "$tmp" 2>/dev/null
   if [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then mv "$tmp" "$out"; return 0; fi
 
+  # First complete object from the first "{", ignoring whatever follows. The
+  # widest span above includes any stray trailing brace: cursor-agent returned a
+  # complete, valid review on #2177 followed by one extra "}" on its own line,
+  # and both attempts were thrown away as "invalid output" over that one byte.
+  perl -0777 -ne 'my $i = index($_, "{"); print substr($_, $i) if $i >= 0;' \
+    "$src" 2>/dev/null | jq -n 'input | objects' > "$tmp" 2>/dev/null
+  if [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then mv "$tmp" "$out"; return 0; fi
+
   rm -f "$tmp" 2>/dev/null
   return 1
 }
