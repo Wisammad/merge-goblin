@@ -182,6 +182,54 @@ reviewer_checkout() {
   mkdir -p "$dest"
 }
 
+# Installed and signed in right now — not whether a subscription still has quota.
+reviewers_available() {
+  local p probe avail=""
+  for p in claude codex cursor; do
+    command -v "provider_${p}_probe" >/dev/null 2>&1 || continue
+    probe="$("provider_${p}_probe" 2>/dev/null)"
+    [ "$(printf '%s' "$probe" | jq -r '.available and .authed' 2>/dev/null)" = true ] \
+      && avail="${avail:+$avail }$p"
+  done
+  printf '%s' "$avail"
+}
+
+reviewers_contributors() {
+  jq -r '(.contributors[]?.provider // empty), (.contributor.provider // empty)
+         | select(. != "")' "$1" 2>/dev/null | sort -u
+}
+
+reviewers_is_contributor() {
+  local p="$1" contributors="$2"
+  printf '%s\n' "$contributors" | grep -qxF "$p" 2>/dev/null
+}
+
+# Spare providers to try when every planned reviewer failed at runtime — ordered
+# by providerFallback, then claude/codex/cursor. Contributors are never asked.
+reviewers_spare_list() {
+  local plan="$1" tried="$2" contributors="$3"
+  local avail fallbacks ordered="" p pp
+  avail="$(reviewers_available)"
+  fallbacks="$(cfg_read | jq -r '.providerFallback[]?' 2>/dev/null)"
+  for pp in $fallbacks claude codex cursor; do
+    case " $ordered " in *" $pp "*) continue ;; esac
+    case " $avail " in *" $pp "*) ;; *) continue ;; esac
+    case " $tried " in *" $pp "*) continue ;; esac
+    reviewers_is_contributor "$pp" "$contributors" && continue
+    ordered="${ordered:+$ordered }$pp"
+  done
+  printf '%s\n' $ordered
+}
+
+reviewers_plan_append() {
+  local plan="$1" p="$2" override="${3:-}" label
+  label="$(reviewer_label "$p")"
+  [ "$p" = claude ] && [ "$override" = opus ] && label='Claude Opus 5'
+  jq --arg p "$p" --arg l "$label" --arg o "$override" \
+    '.reviewers += [{provider:$p,label:$l,modelOverride:$o,spare:true}]' \
+    "$plan" > "$plan.tmp" 2>/dev/null && mv "$plan.tmp" "$plan"
+}
+
 # reviewers_run <plan.json> <prompt> <repo-dir> <work-dir>
 #
 # Succeeds when AT LEAST ONE reviewer produced a review. Failing because a single
@@ -218,8 +266,34 @@ EOF
     if wait "$pid"; then ok=$((ok + 1)); else failed=$((failed + 1)); fi
   done < "$jobs"
 
-  [ "$ok" -gt 0 ] && [ "$failed" -gt 0 ] \
-    && log "  $failed reviewer(s) failed; continuing with the $ok that finished"
+  if [ "$ok" -gt 0 ]; then
+    [ "$failed" -gt 0 ] \
+      && log "  $failed reviewer(s) failed; continuing with the $ok that finished"
+    return 0
+  fi
+
+  # Every planned reviewer failed — often quota on one subscription and a local
+  # setup fault on another, while a third CLI was never in the plan at all.
+  local contributors tried spare p reviewer_dir
+  contributors="$(reviewers_contributors "$plan")"
+  tried="$(jq -r '.reviewers[].provider' "$plan" 2>/dev/null | paste -sd' ' -)"
+  for p in $(reviewers_spare_list "$plan" "$tried" "$contributors"); do
+    log "  planned reviewer(s) all failed — trying spare $(reviewer_label "$p")"
+    reviewers_plan_append "$plan" "$p" ""
+    tried="${tried:+$tried }$p"
+    reviewer_dir="$work/repo-$p"
+    if ! reviewer_checkout "$dir" "$reviewer_dir"; then
+      jq -n --arg p "$p" \
+        '{provider:$p,ok:false,kind:"checkout",error:"could not stage a working copy"}' \
+        > "$work/meta-$p.json"
+      continue
+    fi
+    if reviewer_run_one "$p" "" "$prompt" "$reviewer_dir" "$work"; then
+      ok=1
+      break
+    fi
+  done
+
   [ "$ok" -gt 0 ]
 }
 
