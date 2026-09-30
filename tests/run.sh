@@ -1965,8 +1965,12 @@ test_exact_audits_use_isolated_checkouts() (
     "$RUNTMP"/checkout-42-*) ;;
     *) echo "exact audit reused the shared checkout"; return 1 ;;
   esac
+  # Scheduled reviews get their own copy too; the base is only cloned from.
   ONLY_PR=""
-  eq "$(goblin_repo_dir acme/repo)" "$(engine_checkout_dir acme/repo 42)" || return 1
+  case "$(engine_checkout_dir acme/repo 42)" in
+    "$RUNTMP"/checkout-42-*) ;;
+    *) echo "scheduled review worked inside the shared base"; return 1 ;;
+  esac
   teardown
 )
 
