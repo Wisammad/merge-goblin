@@ -23,6 +23,7 @@ UNTIL_CLEAN=false; MAX_PASSES=""
 REVIEWS_THIS_RUN=0
 RUN_LOCK_HELD=false
 ACTIVE_CHECKOUT=""
+ACTIVE_WORK=""
 FANOUT_PIDS=""
 
 cmd_run() {
@@ -131,24 +132,24 @@ engine_run_lock_release() {
   if [ "$RUN_LOCK_HELD" = true ]; then lock_release; RUN_LOCK_HELD=false; fi
 }
 
+# Every review gets its own copy, made fresh and deleted when the review ends —
+# scheduled or exact-PR, every pass of a sweep. The shared base under repos/ is
+# only ever an object store to clone from, never a tree a review reads: a copy
+# reused across reviews carried one review's state into the next, and one left
+# behind by a failed fetch was picked up by the next pass as-is. A copy is a
+# local `--shared` clone of a base kept fresh by engine_base_refresh, so making
+# it per review costs well under a second and no network.
 engine_checkout_dir() {
-  # A sweep hands its passes one checkout. Each pass is a fresh process on
-  # purpose (see engine_sweep_pass), so keying this on $$ gave every pass its own
-  # directory: a 5-pass sweep cloned and deleted the repository five times, and
-  # the pass trap destroyed it on the way out each time. The pass isolation that
-  # comment is defending is about REVIEWS_THIS_RUN, the claim and the quota
-  # reservation — none of which live in the working tree — so sharing the tree
-  # costs none of it. engine_checkout already re-fetches and resets whatever it
-  # is handed, so a reused directory is brought back to a clean state anyway.
-  if [ -n "${GOBLIN_SWEEP_CHECKOUT:-}" ]; then printf '%s' "$GOBLIN_SWEEP_CHECKOUT"
-  elif [ -n "$ONLY_PR" ]; then printf '%s/checkout-%s-%s' "$RUNTMP" "$2" "$$"
-  else goblin_repo_dir "$1"
-  fi
+  printf '%s/checkout-%s-%s' "$RUNTMP" "$2" "$$"
 }
 
+# Deletes this process's review copy and review scratch. Called when each review
+# returns and again from the EXIT/INT/TERM trap, so a killed or crashed review
+# leaves nothing behind either; goblin_tmp_gc only has to catch a SIGKILL.
 engine_checkout_release() {
-  [ -n "$ACTIVE_CHECKOUT" ] && rm -rf "$ACTIVE_CHECKOUT"
-  ACTIVE_CHECKOUT=""
+  [ -n "${ACTIVE_CHECKOUT:-}" ] && rm -rf "$ACTIVE_CHECKOUT"
+  [ -n "${ACTIVE_WORK:-}" ] && rm -rf "$ACTIVE_WORK"
+  ACTIVE_CHECKOUT=""; ACTIVE_WORK=""
 }
 
 # --auto is intentionally a local head watcher, not a webhook server. It keeps
@@ -243,11 +244,9 @@ engine_sweep() {
   result="$RUNTMP/sweep-$$.json"
   seen="$RUNTMP/sweep-seen-$$.json"; echo '[]' > "$seen"
 
-  # One checkout for the whole sweep. Released below on every exit from this
-  # function; goblin_tmp_gc is the backstop if the sweep is killed outright.
-  local sweep_started per_pass="" cloned_once=false
+  # Each pass is a separate review with its own fresh copy (engine_checkout_dir).
+  local sweep_started per_pass=""
   sweep_started="$(now_epoch)"
-  GOBLIN_SWEEP_CHECKOUT="$RUNTMP/checkout-$pr-sweep$$"; export GOBLIN_SWEEP_CHECKOUT
 
   log "sweeping $repo#$pr until a pass finds nothing new (at most $max pass(es))"
 
@@ -287,7 +286,6 @@ engine_sweep() {
       per_pass="${per_pass:+$per_pass, }pass $pass: 0"
       engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
         "$per_pass" "clean — pass $pass raised nothing new"
-      engine_sweep_release
       return 0
     fi
     total=$((total + fresh))
@@ -299,7 +297,6 @@ engine_sweep() {
   if [ "$outcome" != "posted" ]; then
     engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
       "$per_pass" "stopped — ${outcome:-the pass reported no outcome}"
-    engine_sweep_release
     return 1
   fi
   # This ceiling stays a real stop even when caps are advisory: the sweep ends on
@@ -310,13 +307,7 @@ engine_sweep() {
   log "run it again, or raise maxPassesPerPr: $GOBLIN_SLUG config set .maxPassesPerPr $((max + 3))"
   engine_sweep_summary "$repo" "$pr" "$pass" "$max" "$total" "$sweep_started" \
     "$per_pass" "hit the $max-pass ceiling, still finding things"
-  engine_sweep_release
   return 0
-}
-
-engine_sweep_release() {
-  [ -n "${GOBLIN_SWEEP_CHECKOUT:-}" ] && rm -rf "$GOBLIN_SWEEP_CHECKOUT"
-  unset GOBLIN_SWEEP_CHECKOUT
 }
 
 # What the whole loop did, once, at the end — the per-pass lines scroll away and
@@ -884,6 +875,7 @@ engine_pr_unlocked() {
 
   engine_review_pr "$slug" "$pr" "$head" "$title" "$url" "$base" "$provider" "$last_sha"
   local rc=$?
+  engine_checkout_release
   claim_release; claim_release_comment
   return $rc
 }
@@ -892,6 +884,7 @@ engine_pr_unlocked() {
 engine_review_pr() {
   local slug="$1" pr="$2" head="$3" title="$4" url="$5" base="$6" provider="$7" last_sha="$8"
   local work="$RUNTMP/pr-$pr-$$"; rm -rf "$work"; mkdir -p "$work/raw"
+  ACTIVE_WORK="$work"
 
   log "  #$pr: reviewing ($title)"
   status_set "$(jq -nc --arg a "reviewing #$pr — $title" '{state:"reviewing",activity:$a}')"
@@ -912,19 +905,13 @@ engine_review_pr() {
   diff_annotated  "$work/files.json" "$work/diff.txt" "$(cfg_get '.maxDiffBytes' 400000)"
 
   # 2. a checkout, so the model can read surrounding code
-  local repo_dir isolated_checkout=false
+  local repo_dir
   repo_dir="$(engine_checkout_dir "$slug" "$pr")"
-  # ACTIVE_CHECKOUT is what the EXIT trap deletes, so only claim it when this
-  # process owns the directory. A sweep-owned checkout outlives the pass and is
-  # released by the sweep.
-  if [ -n "$ONLY_PR" ]; then
-    isolated_checkout=true
-    [ -z "${GOBLIN_SWEEP_CHECKOUT:-}" ] && ACTIVE_CHECKOUT="$repo_dir"
-  fi
+  ACTIVE_CHECKOUT="$repo_dir"
   if ! engine_checkout "$slug" "$pr" "$repo_dir"; then
     log "  #$pr: no local checkout (reviewing from diff only)"
-    [ "$isolated_checkout" = true ] && [ -z "${GOBLIN_SWEEP_CHECKOUT:-}" ] && engine_checkout_release
-    repo_dir="$work"; isolated_checkout=false
+    rm -rf "$repo_dir"; ACTIVE_CHECKOUT=""
+    repo_dir="$work"
   fi
 
   # 3. context: PR meta, ticket, findings already posted
@@ -957,7 +944,6 @@ engine_review_pr() {
 
   if [ "$DRY_RUN" = true ]; then
     engine_dry_run "$work" "$slug" "$pr" "$head" "$base" "$provider"
-    [ "$isolated_checkout" = true ] && engine_checkout_release
     rm -rf "$work"; return 0
   fi
 
@@ -978,7 +964,6 @@ engine_review_pr() {
     attempt_record "${slug}#${pr}:${head}" "$kind"
     status_set '{"state":"idle","activity":""}'
     engine_pass_write "the review itself failed${errors:+ ($errors)}" 0 "$head"
-    [ "$isolated_checkout" = true ] && engine_checkout_release
     rm -rf "$work"; return 1
   fi
 
@@ -991,7 +976,6 @@ engine_review_pr() {
 
   engine_publish "$work" "$slug" "$pr" "$head" "$base" "$title" "$url" "$provider" "$prior_json" "$last_sha"
   local rc=$?
-  [ "$isolated_checkout" = true ] && engine_checkout_release
   rm -rf "$work"
   return $rc
 }
@@ -1160,72 +1144,61 @@ engine_base_refresh() {
   return 0
 }
 
-# Standalone clone (never a worktree under ~/Documents — macOS TCC blocks
-# launchd from reading there), reset hard before every checkout because leftover
-# dirty files made `gh pr checkout` abort on every PR once.
+# engine_checkout <slug> <pr> <dir> — a fresh copy of the PR in <dir>.
+#
+# Never a worktree under ~/Documents (macOS TCC blocks launchd from reading
+# there). Always a NEW directory: whatever is at <dir> is removed first, so no
+# review ever starts from another review's tree.
+#
+# The copy borrows objects from the base on DISK (`clone --shared`), then points
+# origin back at GitHub. Not `--reference <base> <url>`: that still negotiates the
+# whole repository with the server, and when that transfer broke mid-way ("curl
+# 18 Transferred a partial file") the old fallback answered a failed transfer by
+# starting a BIGGER one, a full 737MB clone. With several sweeps running that
+# saturated the link, which caused more partial transfers: `git ls-remote`
+# measured 40s with two clones in flight against 4.5s with one. A local clone
+# moves no bytes over the network; engine_base_refresh keeps the base current, so
+# the fetch below pulls only what was pushed in the last few seconds.
 engine_checkout() {
-  local slug="$1" pr="$2" dir="$3"
-  if ! git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
-    if [ -n "$ONLY_PR" ]; then log "  cloning isolated checkout for $slug#$pr"
-    else log "  cloning $slug (one-time)"
+  local slug="$1" pr="$2" dir="$3" base cerr
+  base="$(goblin_repo_dir "$slug")"
+  cerr="${RUNTMP:-/tmp}/.clone-err-$$"
+  if [ ! -d "$base/.git" ]; then
+    # Only for a repo never reviewed on this machine. The base is permanent and
+    # every later review borrows from it, so this download happens once.
+    log "  no local base for $slug yet — cloning it once from GitHub"
+    rm -rf "$base"; mkdir -p "$(dirname "$base")"
+    if ! git clone --quiet "https://github.com/$slug.git" "$base" 2>"$cerr"; then
+      log "  base clone failed: $(head -c 200 "$cerr" 2>/dev/null)"
+      rm -rf "$base"; rm -f "$cerr"; return 1
     fi
-    rm -rf "$dir"
-    # Borrow objects from the persistent clone rather than refetching the repo.
-    # An isolated checkout was a full clone straight from GitHub: 771MB and
-    # minutes on this repo, per run, while an identical copy sat unused in
-    # repos/. Four concurrent sweeps meant 3.2GB of scratch and four simultaneous
-    # downloads of the same objects. Measured after: 0.17s and 108KB.
-    #
-    # Clone from the base on DISK, then point origin back at GitHub. Not
-    # `--reference <base> <url>`: that still negotiates the whole repository with
-    # the server, and when that transfer broke mid-way ("curl 18 Transferred a
-    # partial file", "early EOF") the old fallback answered a failed transfer by
-    # starting a BIGGER one -- a full 737MB clone. With several sweeps running
-    # that saturates the link, which causes more partial transfers, which trigger
-    # more full clones: `git ls-remote` measured 40s with two clones in flight
-    # against 4.5s with one. A local clone moves no bytes over the network at
-    # all, and the fetch below pulls only what the base is missing.
-    local base cerr; base="$(goblin_repo_dir "$slug")"
-    cerr="$(dirname "$dir")/.clone-err-$$"
-    if [ "$base" != "$dir" ] && [ -d "$base/.git" ]; then
-      # Borrowed objects live in the base repo, so a gc there could prune one out
-      # from under a live checkout. Cheap insurance: the base is scratch we
-      # refetch anyway, and nothing else depends on it staying packed.
-      git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
-      engine_base_refresh "$base"
-      # No fallback here on purpose. A base that exists but cannot be cloned
-      # from is a real fault — a corrupt repo, a full disk, a permission — and
-      # answering it with a 737MB download is exactly what turned one broken
-      # transfer into an hour of saturated link and more broken transfers. Fail,
-      # say why, and let the next run retry a cheap local clone.
-      if ! git clone --quiet --shared --no-checkout "$base" "$dir" 2>"$cerr"; then
-        log "  clone from the local base failed: $(head -c 200 "$cerr" 2>/dev/null)"
-        log "  (base: $base — check it with: git -C \"$base\" fsck)"
-        rm -rf "$dir"; rm -f "$cerr"; return 1
-      fi
-      git -C "$dir" remote set-url origin "https://github.com/$slug.git" 2>/dev/null
-    else
-      # Only when there is no base at all — a first review of a new repo.
-      log "  no local base for $slug yet — cloning it once from GitHub"
-      git clone --quiet "https://github.com/$slug.git" "$dir" 2>"$cerr" || {
-        log "  clone failed: $(head -c 200 "$cerr" 2>/dev/null)"; rm -f "$cerr"; return 1; }
-    fi
-    rm -f "$cerr"
   fi
-  # The base can be weeks stale, so this fetch is what makes the shared clone
-  # current. It is a delta, not a repository.
+  # Borrowed objects live in the base repo, so a gc there could prune one out
+  # from under a live copy.
+  git -C "$base" config gc.auto 0 >/dev/null 2>&1 || true
+  engine_base_refresh "$base"
+
+  log "  fresh copy for $slug#$pr"
+  rm -rf "$dir"
+  # No network fallback on purpose. A base that exists but cannot be cloned from
+  # is a real fault (corrupt repo, full disk, permission), and answering it with
+  # a 737MB download is exactly what turned one broken transfer into an hour of
+  # saturated link. Fail, say why, and let the next run retry a cheap local clone.
+  if ! git clone --quiet --shared --no-checkout "$base" "$dir" 2>"$cerr"; then
+    log "  copy from the local base failed: $(head -c 200 "$cerr" 2>/dev/null)"
+    log "  (base: $base — check it with: git -C \"$base\" fsck)"
+    rm -rf "$dir"; rm -f "$cerr"; return 1
+  fi
+  rm -f "$cerr"
+  git -C "$dir" remote set-url origin "https://github.com/$slug.git" 2>/dev/null
   # Both of these used to fail mutely, and the caller then reported the generic
   # "no local checkout (reviewing from diff only)" — a review silently downgraded
   # to a worse one, with the reason nowhere in the log.
-  # Not derived from $cerr: that is only assigned on the clone path, and this
-  # runs on the reuse path too, where it would resolve to a stray "./.fetch".
   local ferr="${RUNTMP:-/tmp}/.fetch-err-$$"
   if ! git -C "$dir" fetch --quiet origin 2>"$ferr"; then
     log "  fetch failed in $dir: $(head -c 200 "$ferr" 2>/dev/null)"
     rm -f "$ferr"; return 1
   fi
-  git -C "$dir" reset --hard --quiet >/dev/null 2>&1
-  git -C "$dir" clean -ffd >/dev/null 2>&1
   if ! ( cd "$dir" && gh pr checkout "$pr" --repo "$slug" --detach 2>"$ferr" ); then
     log "  gh pr checkout $pr failed: $(head -c 200 "$ferr" 2>/dev/null)"
     rm -f "$ferr"; return 1
