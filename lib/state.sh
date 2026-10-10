@@ -166,7 +166,7 @@ status_set() {
   # other process's lock mid-write.
   local locked=false; goblin_state_lock status && locked=true
   cur="$(cat "$STATUS" 2>/dev/null)"
-  if ! printf '%s' "$cur" | jq -e . >/dev/null 2>&1; then
+  if ! printf '%s' "$cur" | json_ok; then
     cur='{"schemaVersion":1,"state":"idle","pausedReason":"","activity":"","lastRunStarted":0,"lastRunFinished":0,"nextRunEstimate":0}'
   fi
   stats="$(compute_stats)"
@@ -229,7 +229,7 @@ ui_setup_complete() {
 ui_state_write() {
   local st stats running disabled installed inbox stuck now interval update
   st="$(cat "$STATUS" 2>/dev/null)"
-  printf '%s' "$st" | jq -e . >/dev/null 2>&1 || st='{}'
+  printf '%s' "$st" | json_ok || st='{}'
   stats="$(compute_stats)"
   running=false;   agent_running   >/dev/null 2>&1 && running=true
   disabled=false;  agent_disabled  >/dev/null 2>&1 && disabled=true
@@ -239,7 +239,7 @@ ui_state_write() {
   # Read the cached update check; never perform one. This runs on every status
   # write, including interactive ones, and must stay free of network calls.
   update="$(cat "$UPDATE_STATE" 2>/dev/null)"
-  printf '%s' "$update" | jq -e . >/dev/null 2>&1 || update='{}'
+  printf '%s' "$update" | json_ok || update='{}'
 
   inbox='{"waiting":0,"mine":0,"at":0,"stale":true}'
   if [ -f "$INBOX" ]; then

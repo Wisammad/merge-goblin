@@ -30,6 +30,9 @@ eq() { # eq <expected> <actual> [label]
   echo "expected: '$1'"; echo "actual:   '$2'"; return 1
 }
 
+# stamp_ago <minutes> — a `touch -t` stamp that many minutes back (BSD, then GNU date).
+stamp_ago() { date -v-"$1"M '+%Y%m%d%H%M' 2>/dev/null || date -d "-$1 min" '+%Y%m%d%H%M'; }
+
 setup() {
   GOBLIN_HOME="$(mktemp -d)"; export GOBLIN_HOME
   export GOBLIN_APP="$ROOT"
@@ -86,7 +89,7 @@ test_live_audits_do_not_expire() (
   trap teardown EXIT
   goblin_ensure_dirs
   pr_lock_acquire acme/repo 7 || return 1
-  touch -t "$(date -v-2d '+%Y%m%d%H%M')" "$PR_LOCKDIR"
+  touch -t "$(stamp_ago 2880)" "$PR_LOCKDIR"
   pr_lock_busy acme/repo 7 || return 1
   ( PR_LOCKDIR=''; pr_lock_acquire acme/repo 7 ) && return 1
   reservation_try 'acme/repo#7:abc' 1 || return 1
@@ -220,11 +223,11 @@ test_pr_lock_staleness_scales_with_configured_timeout() (
   # this codebase uses, but well within the ~4h a single review can
   # legitimately still be running at this configured timeout (one repair
   # retry doubles it, plus overhead) — must not be stolen as abandoned.
-  touch -t "$(date -v-200M '+%Y%m%d%H%M')" "$dir"
+  touch -t "$(stamp_ago 200)" "$dir"
   ( PR_LOCKDIR=""; pr_lock_acquire acme/repo 9 ) \
     && { echo "a still-plausible-in-flight PR lock was stolen as stale"; return 1; }
   # But one old enough to exceed even that generous window is still reclaimed.
-  touch -t "$(date -v-300M '+%Y%m%d%H%M')" "$dir"
+  touch -t "$(stamp_ago 300)" "$dir"
   ( PR_LOCKDIR=""; pr_lock_acquire acme/repo 9 && pr_lock_release ) \
     || { echo "a genuinely abandoned PR lock was never reclaimed"; return 1; }
   teardown
@@ -955,6 +958,13 @@ test_migrate_preserves_ledger_and_events() {
 }
 
 # ------------------------------------------------------------- rendering ---
+test_json_ok_rejects_empty() (
+  . "$ROOT/lib/core.sh"
+  printf '' | json_ok && { echo "empty input passed as JSON"; return 1; }
+  printf 'not json' | json_ok && { echo "garbage passed as JSON"; return 1; }
+  printf '{"a":1}' | json_ok || { echo "a real object was rejected"; return 1; }
+)
+
 test_ui_state_is_valid_json() {
   setup
   status_set '{"state":"idle"}'
@@ -2689,6 +2699,7 @@ t "fleet: assignment deterministic"      test_assignment_is_deterministic_and_sp
 t "fleet: empty fleet"                   test_assignment_empty_fleet
 t "agent: label is per-user"             test_agent_label_is_per_user
 t "migrate: preserves ledger + events"   test_migrate_preserves_ledger_and_events
+t "core: json_ok rejects empty input"     test_json_ok_rejects_empty
 t "ui: state cache is valid json"        test_ui_state_is_valid_json
 t "ui: serves, refuses bad token"        test_ui_serves_and_refuses_bad_token
 t "ui: action verbs are allowlisted"     test_ui_rejects_unlisted_verbs
