@@ -47,9 +47,11 @@ provider_claude_probe() {
 # provider_claude_review <prompt_file> <repo_dir> <schema> <out_json> <raw_dir>
 provider_claude_review() {
   local pf="$1" dir="$2" schema="$3" out="$4" raw="$5"
-  local bin model t0 rc=0
+  local bin model eff t0 rc=0
   bin="$(provider_claude_bin)" || { GOBLIN_P_ERRKIND=other; GOBLIN_P_ERRMSG="claude not found"; return 1; }
   model="${GOBLIN_MODEL_OVERRIDE:-$(cfg_get '.providers.claude.model' 'sonnet')}"
+  # Empty means claude's own default (settings.json effortLevel), as before.
+  eff="$(cfg_get '.providers.claude.reasoningEffort' '')"
   t0="$(now_epoch)"
 
   # --tools "" removes all tool access: with the model no longer posting, it only
@@ -62,6 +64,7 @@ provider_claude_review() {
   ( cd "$dir" 2>/dev/null || exit 1
     "$bin" -p \
       --model "$model" \
+      ${eff:+--effort "$eff"} \
       --output-format json \
       --json-schema "$(cat "$schema")" \
       --tools "" \
