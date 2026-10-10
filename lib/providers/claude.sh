@@ -49,7 +49,7 @@ provider_claude_review() {
   local pf="$1" dir="$2" schema="$3" out="$4" raw="$5"
   local bin model eff t0 rc=0
   bin="$(provider_claude_bin)" || { GOBLIN_P_ERRKIND=other; GOBLIN_P_ERRMSG="claude not found"; return 1; }
-  model="${GOBLIN_MODEL_OVERRIDE:-$(cfg_get '.providers.claude.model' 'sonnet')}"
+  model="${GOBLIN_MODEL_OVERRIDE:-$(cfg_get '.providers.claude.model' 'opus')}"
   # Empty means claude's own default (settings.json effortLevel), as before.
   eff="$(cfg_get '.providers.claude.reasoningEffort' '')"
   t0="$(now_epoch)"

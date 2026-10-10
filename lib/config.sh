@@ -15,7 +15,7 @@ goblin_default_config() {
   "intervalSeconds": 300,
   "provider": "claude",
   "providers": {
-    "claude": { "model": "sonnet", "bin": "" },
+    "claude": { "model": "opus", "bin": "" },
     "codex":  { "model": "", "reasoningEffort": "medium", "bin": "" },
     "cursor": { "model": "$GOBLIN_CURSOR_DEFAULT_MODEL", "bin": "" }
   },
