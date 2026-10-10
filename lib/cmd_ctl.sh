@@ -45,7 +45,7 @@ cmd_ctl() {
       cfg_set ".snoozeUntil=${until_ts}"
       if [ "$until_ts" -gt 0 ]; then
         status_set "$(jq -nc --argjson u "$until_ts" '{state:"snoozed",pausedReason:"snoozed",snoozeUntil:$u,activity:""}')"
-        echo "snoozed until $(date -r "$until_ts" '+%H:%M')"
+        echo "snoozed until $(fmt_epoch "$until_ts" '+%H:%M')"
       else
         status_set '{"state":"idle","pausedReason":"","activity":""}'
         echo "snooze cleared"
