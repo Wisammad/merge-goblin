@@ -129,7 +129,7 @@ EOF
 repos_cache_read() {
   local cache d; cache="$(repos_cache_path)"
   d="$(cat "$cache" 2>/dev/null)"
-  printf '%s' "$d" | jq -e . >/dev/null 2>&1 && printf '%s' "$d" || printf '{"at":0,"repos":[]}'
+  printf '%s' "$d" | json_ok && printf '%s' "$d" || printf '{"at":0,"repos":[]}'
 }
 
 # goblin repos search [--json] [--query Q] [--limit N] [--refresh]

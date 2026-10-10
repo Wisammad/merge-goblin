@@ -113,7 +113,7 @@ inbox_write() {
 
 inbox_read() {
   local d; d="$(cat "$INBOX" 2>/dev/null)"
-  printf '%s' "$d" | jq -e . >/dev/null 2>&1 && printf '%s' "$d" \
+  printf '%s' "$d" | json_ok && printf '%s' "$d" \
     || printf '{"schemaVersion":%s,"at":0,"stale":true,"counts":{"waiting":0,"mine":0},"prs":[]}' \
          "$INBOX_SCHEMA_VERSION"
 }

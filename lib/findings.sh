@@ -10,7 +10,7 @@ findings_extract() {
   local src="$1" out="$2"
   [ -s "$src" ] || return 1
 
-  if jq -e . "$src" >/dev/null 2>&1; then cp "$src" "$out"; return 0; fi
+  if [ -s "$src" ] && jq -e . "$src" >/dev/null 2>&1; then cp "$src" "$out"; return 0; fi
 
   # Content of fenced code blocks.
   local tmp="$out.cand"

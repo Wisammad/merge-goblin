@@ -54,7 +54,7 @@ cfg_read() { cat "$CONFIG" 2>/dev/null; }
 
 cfg_ensure() {
   goblin_ensure_dirs
-  if ! cfg_read | jq -e . >/dev/null 2>&1; then
+  if ! cfg_read | json_ok; then
     goblin_default_config > "$CONFIG"
   fi
 }

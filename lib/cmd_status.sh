@@ -11,7 +11,7 @@ cmd_status() {
 
   ui_state_write
   local m; m="$(cat "$UISTATE" 2>/dev/null)"
-  printf '%s' "$m" | jq -e . >/dev/null 2>&1 || m='{}'
+  printf '%s' "$m" | json_ok || m='{}'
 
   local state reason activity
   state="$(printf '%s' "$m"    | jq -r '.state // "idle"')"
