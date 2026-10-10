@@ -110,7 +110,7 @@ attempt_reason() {
   case "$n" in ''|null|*[!0-9]*) return 0 ;; esac
   [ "$n" -gt 0 ] || return 0
   case "$next" in ''|null|*[!0-9]*) next=0 ;; esac
-  [ "$next" -gt "$(now_epoch)" ] && when=", next try $(date -r "$next" '+%H:%M')"
+  [ "$next" -gt "$(now_epoch)" ] && when=", next try $(fmt_epoch "$next" '+%H:%M')"
   case "$kind" in ''|null) kind="" ;; *) kind=" ($kind)" ;; esac
   printf '%s failed attempt(s)%s%s' "$n" "$kind" "$when"
 }

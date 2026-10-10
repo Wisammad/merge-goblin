@@ -8,8 +8,12 @@
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/bin:$PATH"
 
 now_epoch()      { date +%s; }
-midnight_epoch() { date -v0H -v0M -v0S +%s; }
-tomorrow_epoch() { date -v+1d -v0H -v0M -v0S +%s; }
+# BSD date first (macOS), then GNU date (Linux): the flags share no syntax, and
+# GNU `date -r` means "a file's mtime", so an epoch there is an error, not a time.
+midnight_epoch() { date -v0H -v0M -v0S +%s 2>/dev/null || date -d 'today 00:00' +%s; }
+tomorrow_epoch() { date -v+1d -v0H -v0M -v0S +%s 2>/dev/null || date -d 'tomorrow 00:00' +%s; }
+# fmt_epoch <epoch> <format> — a local time for display.
+fmt_epoch() { date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2"; }
 week_ago_epoch() { echo $(( $(date +%s) - 604800 )); }
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }

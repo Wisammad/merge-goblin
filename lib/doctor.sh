@@ -231,7 +231,7 @@ doctor_menu() {
 
 doctor_state() {
   local free
-  free="$(df -g "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+  free="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print int($4 / 1048576)}')"
   if [ -n "$free" ] && [ "$free" -lt 5 ] 2>/dev/null; then
     _doc warn "disk" "${free}GB free — clones need room" "free some space"
   else
@@ -249,7 +249,7 @@ doctor_state() {
   fi
   local last; last="$(cat "$STATUS" 2>/dev/null | jq -r '.lastRunFinished // 0' 2>/dev/null)"
   if [ "${last:-0}" -gt 0 ] 2>/dev/null; then
-    _doc ok "last run" "$(date -r "$last" '+%Y-%m-%d %H:%M')"
+    _doc ok "last run" "$(fmt_epoch "$last" '+%Y-%m-%d %H:%M')"
   else
     _doc ok "last run" "never"
   fi
