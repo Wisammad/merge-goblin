@@ -958,6 +958,21 @@ test_migrate_preserves_ledger_and_events() {
 }
 
 # ------------------------------------------------------------- rendering ---
+test_claude_effort_is_passed_only_when_set() (
+  setup
+  . "$ROOT/lib/providers/claude.sh"
+  local stub="$GOBLIN_HOME/claude-stub" args="$GOBLIN_HOME/args" w="$GOBLIN_HOME/w"
+  mkdir -p "$w"; echo prompt > "$w/prompt"; echo '{}' > "$w/schema"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "%s"\necho "{}"\n' "$args" > "$stub"; chmod +x "$stub"
+  cfg_set --arg b "$stub" '.providers.claude.bin = $b'
+  provider_claude_review "$w/prompt" "$w" "$w/schema" "$w/out.json" "$w" >/dev/null 2>&1
+  grep -qx -- '--effort' "$args" && { echo "--effort passed with nothing configured"; return 1; }
+  cfg_set '.providers.claude.reasoningEffort = "medium"'
+  provider_claude_review "$w/prompt" "$w" "$w/schema" "$w/out.json" "$w" >/dev/null 2>&1
+  grep -A1 -x -- '--effort' "$args" | grep -qx medium || { echo "configured effort did not reach claude"; return 1; }
+  teardown
+)
+
 test_json_ok_rejects_empty() (
   . "$ROOT/lib/core.sh"
   printf '' | json_ok && { echo "empty input passed as JSON"; return 1; }
@@ -2699,6 +2714,7 @@ t "fleet: assignment deterministic"      test_assignment_is_deterministic_and_sp
 t "fleet: empty fleet"                   test_assignment_empty_fleet
 t "agent: label is per-user"             test_agent_label_is_per_user
 t "migrate: preserves ledger + events"   test_migrate_preserves_ledger_and_events
+t "providers: claude effort only when set" test_claude_effort_is_passed_only_when_set
 t "core: json_ok rejects empty input"     test_json_ok_rejects_empty
 t "ui: state cache is valid json"        test_ui_state_is_valid_json
 t "ui: serves, refuses bad token"        test_ui_serves_and_refuses_bad_token
