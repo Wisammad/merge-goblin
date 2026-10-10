@@ -243,6 +243,8 @@ engine_sweep() {
 
   result="$RUNTMP/sweep-$$.json"
   seen="$RUNTMP/sweep-seen-$$.json"; echo '[]' > "$seen"
+  # Every finding new to THIS sweep, with its severity, for the one-line total.
+  SWEEP_FOUND="$RUNTMP/sweep-found-$$.json"; echo '[]' > "$SWEEP_FOUND"
 
   # Each pass is a separate review with its own fresh copy (engine_checkout_dir).
   local sweep_started per_pass=""
@@ -273,6 +275,10 @@ engine_sweep() {
     fresh="$(jq -n --argjson ids "$ids" --slurpfile seen "$seen" \
       '($ids - $seen[0]) | unique | length' 2>/dev/null)"
     case "$fresh" in ''|*[!0-9]*) fresh=0 ;; esac
+    jq --slurpfile seen "$seen" --slurpfile r "$result" '
+      . + [($r[0].found // [])[] | select(.id as $i | $seen[0] | index($i) | not)]
+      | unique_by(.id)' "$SWEEP_FOUND" > "$SWEEP_FOUND.t" 2>/dev/null \
+      && mv "$SWEEP_FOUND.t" "$SWEEP_FOUND"
     jq -n --argjson ids "$ids" --slurpfile seen "$seen" '($seen[0] + $ids) | unique' \
       > "$seen.t" 2>/dev/null && mv "$seen.t" "$seen"
 
@@ -321,8 +327,12 @@ engine_sweep_summary() {   # <repo> <pr> <passes> <max> <total> <started> <per-p
   log "── sweep summary: $repo#$pr ──"
   log "   passes     $passes of $max"
   log "   findings   $total posted${detail:+  ($detail)}"
+  # One line for the whole sweep: what was found, by severity, across its passes.
+  log "   totals     $(jq '{findings: .}' "${SWEEP_FOUND:-/dev/null}" 2>/dev/null \
+    | jq -r -f "$SHARE_DIR/jq/counts.jq" 2>/dev/null || echo 'no findings') across $passes pass(es)"
+  rm -f "${SWEEP_FOUND:-}" 2>/dev/null
   log "   duration   ${mins}m$(printf '%02d' $(( secs % 60 )))s"
-  log "   checkout   one clone, reused across $passes pass(es)"
+  log "   checkout   a fresh copy per pass, deleted when it ended"
   log "   verdict    $verdict"
 }
 
@@ -338,7 +348,7 @@ engine_sweep_pass() {
     "$GOBLIN_APP/bin/$GOBLIN_SLUG" run --repo "$1" --pr "$2" --force
 }
 
-# engine_pass_write <outcome> [findings] [head] [ids-json] — how this run ended,
+# engine_pass_write <outcome> [findings] [head] [ids-json] [found-json] — how this run ended,
 # for the sweep loop that spawned it. A no-op when nobody asked, so no other
 # caller has to know the mechanism exists.
 #
@@ -349,10 +359,12 @@ engine_sweep_pass() {
 # never make it spin.
 engine_pass_write() {
   [ -n "${GOBLIN_PASS_RESULT:-}" ] || return 0
-  local ids="${4:-[]}"
+  local ids="${4:-[]}" found="${5:-[]}"
   printf '%s' "$ids" | jq -e 'type == "array"' >/dev/null 2>&1 || ids='[]'
+  printf '%s' "$found" | jq -e 'type == "array"' >/dev/null 2>&1 || found='[]'
   jq -nc --arg o "$1" --argjson f "${2:-0}" --arg h "${3:-}" --argjson ids "$ids" \
-    '{outcome:$o, findings:$f, head:$h, ids:$ids}' > "$GOBLIN_PASS_RESULT" 2>/dev/null || true
+    --argjson found "$found" \
+    '{outcome:$o, findings:$f, head:$h, ids:$ids, found:$found}' > "$GOBLIN_PASS_RESULT" 2>/dev/null || true
 }
 
 # --- fanout: every open PR, N workers, each sweeping until clean -----------
@@ -1070,7 +1082,8 @@ engine_publish() {
   # re-raised forever.
   engine_pass_write posted \
     "$(jq '.findings | length' "$work/norm.json" 2>/dev/null || echo 0)" "$head" \
-    "$(jq -c '[.findings[].id]' "$work/norm.json" 2>/dev/null || echo '[]')"
+    "$(jq -c '[.findings[].id]' "$work/norm.json" 2>/dev/null || echo '[]')" \
+    "$(jq -c '[.findings[] | {id, severity}]' "$work/norm.json" 2>/dev/null || echo '[]')"
   events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"
   # The moment the posted event exists, today_review_count sees it — holding
   # the reservation any longer double-counts this same review as both
@@ -1144,6 +1157,39 @@ engine_base_refresh() {
   return 0
 }
 
+# engine_base_init <slug> <base> — the first clone of a repo never reviewed here.
+#
+# Fanout runs several workers at once, and on a repo's first review they all
+# found no base together: each deleted and cloned into the same directory, and a
+# failing one deleted a clone another had just finished. One worker clones under
+# a per-base lock; the rest wait, then find the base already there. The clone
+# lands in a temp directory and is renamed into place only when complete, so a
+# `.git` at <base> always means a whole repository — even after a crash.
+engine_base_init() {
+  local slug="$1" base="$2" lock tmp cerr tries=0
+  lock="$STATE_LOCKS_DIR/base-init-$(goblin_hash "$base")"
+  mkdir -p "$STATE_LOCKS_DIR" "$(dirname "$base")" 2>/dev/null
+  while ! lock_acquire "$lock" 60; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 1800 ] && { log "  base clone: lock still held after 30m, giving up"; return 1; }
+    sleep 1
+  done
+  if [ -d "$base/.git" ]; then lock_release "$lock"; return 0; fi
+  log "  no local base for $slug yet — cloning it once from GitHub"
+  tmp="$base.cloning-$$"; cerr="${RUNTMP:-/tmp}/.clone-err-$$"
+  rm -rf "$tmp"
+  if ! git clone --quiet "https://github.com/$slug.git" "$tmp" 2>"$cerr"; then
+    log "  base clone failed: $(head -c 200 "$cerr" 2>/dev/null)"
+    rm -rf "$tmp"; rm -f "$cerr"; lock_release "$lock"; return 1
+  fi
+  rm -f "$cerr"
+  # Anything at <base> without a .git is a leftover from before this lock existed.
+  rm -rf "$base"
+  mv "$tmp" "$base" || { rm -rf "$tmp"; lock_release "$lock"; return 1; }
+  lock_release "$lock"
+  return 0
+}
+
 # engine_checkout <slug> <pr> <dir> — a fresh copy of the PR in <dir>.
 #
 # Never a worktree under ~/Documents (macOS TCC blocks launchd from reading
@@ -1164,14 +1210,7 @@ engine_checkout() {
   base="$(goblin_repo_dir "$slug")"
   cerr="${RUNTMP:-/tmp}/.clone-err-$$"
   if [ ! -d "$base/.git" ]; then
-    # Only for a repo never reviewed on this machine. The base is permanent and
-    # every later review borrows from it, so this download happens once.
-    log "  no local base for $slug yet — cloning it once from GitHub"
-    rm -rf "$base"; mkdir -p "$(dirname "$base")"
-    if ! git clone --quiet "https://github.com/$slug.git" "$base" 2>"$cerr"; then
-      log "  base clone failed: $(head -c 200 "$cerr" 2>/dev/null)"
-      rm -rf "$base"; rm -f "$cerr"; return 1
-    fi
+    engine_base_init "$slug" "$base" || return 1
   fi
   # Borrowed objects live in the base repo, so a gc there could prune one out
   # from under a live copy.
