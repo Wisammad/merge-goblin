@@ -67,6 +67,8 @@ $GOBLIN_EMOJI $GOBLIN_NAME v$GOBLIN_VERSION — $GOBLIN_TAGLINE
   goblin https://github.com/O/R/pull/N review that PR until a pass finds nothing new
                                       (add --once for a single pass)
   goblin https://github.com/O/R/pulls  every open PR, 3 at a time, same sweep
+  goblin claude|codex|cursor <cmd>    any review command above, with only that reviewer
+                                      (e.g. goblin codex <PR_URL>)
   goblin on | off                     master switch (off survives reboot)
   goblin pause | resume | toggle      temporary stop (agent stays scheduled)
   goblin snooze 1h|tomorrow|<secs>|clear
@@ -84,6 +86,13 @@ EOF
 }
 
 cmd="${1:-status}"; shift 2>/dev/null || true
+
+case "$cmd" in
+  claude|codex|cursor)
+    [ $# -gt 0 ] || { echo "$GOBLIN_SLUG $cmd: needs a command, e.g. '$GOBLIN_SLUG $cmd <PR_URL>'" >&2; exit 2; }
+    export GOBLIN_ONLY_REVIEWER="$cmd"
+    cmd="$1"; shift ;;
+esac
 
 case "$cmd" in
   --auto)   . "$LIB_DIR/engine.sh";      cmd_auto "$@" ;;

@@ -69,8 +69,18 @@ reviewers_plan() {
   local n_ind=0; for p in $independent; do n_ind=$((n_ind + 1)); done
 
   local reviewers="" overrides='' note='' is_independent=true fallback
+  local only="${GOBLIN_ONLY_REVIEWER:-}"
 
-  if [ -z "$contributors" ]; then
+  if [ -n "$only" ]; then
+    reviewers="$only"
+    [ "$only" = claude ] && overrides='claude=opus'
+    case " $contributors " in
+      *" $only "*)
+        is_independent=false
+        note="$(reviewer_label "$only") was requested as the only reviewer and also contributed to this PR — not an independent review" ;;
+      *) note="$(reviewer_label "$only") was requested as the only reviewer" ;;
+    esac
+  elif [ -z "$contributors" ]; then
     # Nothing to exclude. Prefer Claude Opus plus the configured companion —
     # but only when BOTH are actually installed and authed. Hardcoding this
     # pair regardless of `avail` reintroduced the exact failure the
@@ -271,6 +281,9 @@ EOF
       && log "  $failed reviewer(s) failed; continuing with the $ok that finished"
     return 0
   fi
+
+  # A reviewer the user asked for by name is never silently swapped for another.
+  [ -n "${GOBLIN_ONLY_REVIEWER:-}" ] && return 1
 
   # Every planned reviewer failed — often quota on one subscription and a local
   # setup fault on another, while a third CLI was never in the plan at all.
