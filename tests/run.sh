@@ -1738,10 +1738,30 @@ sweep_stub_pass() {
     [0-9]*)  cnt="$step";        tag="pass$n" ;;
     *)       jq -nc --arg o "$step" '{outcome:$o,findings:0,head:"abc",ids:[]}' > "$3"; return 0 ;;
   esac
+  # Severities alternate blocker, risk, blocker… so totals are checkable.
   jq -nc --argjson f "$cnt" --argjson ids "$(sweep_ids "$tag" "$cnt")" \
-    '{outcome:"posted",findings:$f,head:"abc",ids:$ids}' > "$3"
+    '{outcome:"posted",findings:$f,head:"abc",ids:$ids,
+      found:[$ids | to_entries[] | {id:.value, severity:(if .key % 2 == 0 then "blocker" else "risk" end)}]}' > "$3"
 }
 sweep_passes() { wc -l < "$GOBLIN_HOME/sweep-passes" 2>/dev/null | tr -d ' '; }
+
+test_sweep_summary_totals_by_severity() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  engine_sweep_pass() { sweep_stub_pass "$@"; }
+  local out
+  # Pass 1: blocker, risk, blocker. Pass 2: blocker. Pass 3: pass 1's ids again
+  # plus nothing new, so nothing is counted twice and the sweep ends there.
+  sweep_script 3 1 same3
+  out="$(engine_sweep acme/repo 42 2>&1)"
+  printf '%s\n' "$out" | grep -q 'totals     🔴 3 blocker · 🟡 1 risk across 3 pass(es)' \
+    || { echo "summary line wrong:"; printf '%s\n' "$out" | grep totals; return 1; }
+  sweep_script 0
+  out="$(engine_sweep acme/repo 42 2>&1)"
+  printf '%s\n' "$out" | grep -q 'totals     no findings across 1 pass(es)' \
+    || { echo "clean sweep line wrong:"; printf '%s\n' "$out" | grep totals; return 1; }
+  teardown
+)
 
 test_sweep_runs_until_a_pass_finds_nothing_new() (
   setup
@@ -2033,6 +2053,29 @@ test_attempt_blocked_reads_the_legacy_key_too() {
   attempt_blocked "acme/one#7:aaa" && { echo "attempt_clear left the legacy key behind"; return 1; }
   teardown
 }
+
+test_first_base_clone_is_serialised() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local base="$GOBLIN_HOME/repos/acme/repo" clones="$GOBLIN_HOME/clones"
+  : > "$clones"
+  # A slow clone, so both workers are inside the first-time path together.
+  git() {
+    if [ "$1" = clone ]; then
+      local dest; for dest; do :; done
+      echo x >> "$clones"; sleep 1; mkdir -p "$dest/.git"; echo ok > "$dest/.git/HEAD"; return 0
+    fi
+    return 0
+  }
+  engine_base_init acme/repo "$base" & local a=$!
+  engine_base_init acme/repo "$base" & local b=$!
+  wait "$a" || { echo "worker 1 failed"; return 1; }
+  wait "$b" || { echo "worker 2 failed"; return 1; }
+  eq "1" "$(wc -l < "$clones" | tr -d ' ')" || { echo "both workers cloned the base"; return 1; }
+  eq "ok" "$(cat "$base/.git/HEAD")" || { echo "base is not a whole clone"; return 1; }
+  ls -d "$base".cloning-* 2>/dev/null && { echo "temp clone left behind"; return 1; }
+  teardown
+)
 
 test_exact_audits_use_isolated_checkouts() (
   setup
@@ -2705,6 +2748,8 @@ t "reviewers: no-signature plan respects availability" test_no_signature_plan_st
 t "reviewers: contributor signal strips backticks" test_contributor_signal_strips_backticks
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
 t "reviewers: spare tried when all fail"   test_reviewers_fallback_to_spare_provider
+t "sweep: one-line totals by severity"    test_sweep_summary_totals_by_severity
+t "engine: first base clone is serialised" test_first_base_clone_is_serialised
 t "reviewers: requested one is the plan"   test_only_reviewer_is_the_whole_plan
 t "reviewers: requested one gets no spare" test_only_reviewer_gets_no_spare
 t "cli: goblin <provider> needs a command" test_cli_only_reviewer_needs_a_command
