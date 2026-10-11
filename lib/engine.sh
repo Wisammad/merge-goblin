@@ -1134,6 +1134,9 @@ engine_dry_run() {
 #
 # One fetch at a time: concurrent sweeps wait on the lock instead of racing the
 # same download (two transfers in flight is what saturated the link before).
+# A waiter fetches too once it holds the lock: the holder it waited on may have
+# failed, and skipping then sent every waiter's checkout to GitHub at once. After
+# a holder that succeeded, the repeat is only a ref listing.
 # Best-effort: a failed refresh is logged and the checkout's fetch still runs,
 # so a flaky network costs no more than it did without this.
 engine_base_refresh() {
@@ -1142,12 +1145,9 @@ engine_base_refresh() {
   mkdir -p "$STATE_LOCKS_DIR" 2>/dev/null
   while ! lock_acquire "$lock" 20; do
     tries=$((tries + 1))
-    # Another sweep is fetching the base right now; its result is ours too.
     [ "$tries" -ge 600 ] && { log "  base refresh: lock still held after 10m, skipping"; return 0; }
     sleep 1
   done
-  # Waited behind another fetch: the base is already fresh.
-  if [ "$tries" -gt 0 ]; then lock_release "$lock"; return 0; fi
   err="${RUNTMP:-/tmp}/.base-fetch-err-$$"
   if ! git -C "$base" fetch --quiet origin 2>"$err"; then
     log "  base refresh failed (checkout will fetch itself): $(head -c 200 "$err" 2>/dev/null)"
@@ -1174,6 +1174,10 @@ engine_base_init() {
     [ "$tries" -ge 1800 ] && { log "  base clone: lock still held after 30m, giving up"; return 1; }
     sleep 1
   done
+  # A clone killed mid-way (INT, TERM, SIGKILL, power loss) leaves its temp dir
+  # beside the base, and nothing else reaps it. Holding the lock means no live
+  # init is using one.
+  rm -rf "$base".cloning-* 2>/dev/null
   if [ -d "$base/.git" ]; then lock_release "$lock"; return 0; fi
   log "  no local base for $slug yet — cloning it once from GitHub"
   tmp="$base.cloning-$$"; cerr="${RUNTMP:-/tmp}/.clone-err-$$"

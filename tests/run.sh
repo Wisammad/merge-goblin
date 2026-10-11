@@ -2054,6 +2054,32 @@ test_attempt_blocked_reads_the_legacy_key_too() {
   teardown
 }
 
+test_base_refresh_fetches_after_waiting() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local base="$GOBLIN_HOME/repos/acme/repo" fetches="$GOBLIN_HOME/fetches" lock
+  mkdir -p "$base/.git"; : > "$fetches"
+  git() { [ "$2" = fetch ] || [ "$3" = fetch ] && echo x >> "$fetches"; return 0; }
+  # Another refresh holds the lock and then goes away (as if its fetch failed).
+  lock="$STATE_LOCKS_DIR/base-fetch-$(goblin_hash "$base")"
+  sleep 2 & local holder=$!
+  mkdir -p "$lock"; echo "$holder" > "$lock/owner"
+  engine_base_refresh "$base"
+  eq "1" "$(wc -l < "$fetches" | tr -d ' ')" || { echo "a waiter skipped its fetch"; return 1; }
+  teardown
+)
+
+test_base_init_reaps_killed_clones() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local base="$GOBLIN_HOME/repos/acme/repo"
+  mkdir -p "$base/.git" "$base.cloning-99999/.git"
+  engine_base_init acme/repo "$base" || return 1
+  [ -d "$base.cloning-99999" ] && { echo "a killed clone's temp dir was left behind"; return 1; }
+  [ -d "$base/.git" ] || { echo "the base itself was removed"; return 1; }
+  teardown
+)
+
 test_first_base_clone_is_serialised() (
   setup
   . "$ROOT/lib/engine.sh"
@@ -2749,6 +2775,8 @@ t "reviewers: contributor signal strips backticks" test_contributor_signal_strip
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
 t "reviewers: spare tried when all fail"   test_reviewers_fallback_to_spare_provider
 t "sweep: one-line totals by severity"    test_sweep_summary_totals_by_severity
+t "engine: base refresh fetches after waiting" test_base_refresh_fetches_after_waiting
+t "engine: base init reaps killed clones"  test_base_init_reaps_killed_clones
 t "engine: first base clone is serialised" test_first_base_clone_is_serialised
 t "reviewers: requested one is the plan"   test_only_reviewer_is_the_whole_plan
 t "reviewers: requested one gets no spare" test_only_reviewer_gets_no_spare
