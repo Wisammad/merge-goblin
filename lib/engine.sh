@@ -964,7 +964,7 @@ engine_review_pr() {
                "$work/ticket.txt" "$work/prior.txt" "$work/prompt.txt"
 
   if [ "$DRY_RUN" = true ]; then
-    engine_dry_run "$work" "$slug" "$pr" "$head" "$base" "$provider"
+    engine_dry_run "$work" "$slug" "$pr" "$head" "$base" "$provider" "${repo_dir:-$work}"
     rm -rf "$work"; return 0
   fi
 
@@ -1109,6 +1109,9 @@ engine_publish() {
 
 engine_dry_run() {
   local work="$1" slug="$2" pr="$3" head="$4" base="$5" provider="$6"
+  # The tree prompt_build read: the PR checkout. Not the shared base, which
+  # stays on the default branch it was first cloned at.
+  local rules_dir="${7:-$work}"
   local contributor reviewers
   contributor="$(jq -r 'if .contributor.detected then .contributor.label else "none detected" end' "$work/review-plan.json")"
   reviewers="$(jq -r '[.reviewers[].label] | join(" + ")' "$work/review-plan.json")"
@@ -1119,7 +1122,7 @@ engine_dry_run() {
   echo "prompt:            $(wc -c < "$work/prompt.txt" | tr -d ' ') bytes  ($work/prompt.txt)"
   echo "diff:              $(wc -c < "$work/diff.txt" | tr -d ' ') bytes, $(jq 'length' "$work/files.json") files"
   echo "addressable lines: $(jq 'length' "$work/addr.json")"
-  echo "review rules from: $(prompt_discover "$(goblin_repo_dir "$slug")" "$slug" 2>/dev/null | sed "s|$(goblin_repo_dir "$slug")/||" || echo '(built-in fallback)')"
+  echo "review rules from: $(prompt_discover "$rules_dir" "$slug" 2>/dev/null | sed "s|$rules_dir/||" || echo '(built-in fallback)')"
   echo "ticket context:    $([ -s "$work/ticket.txt" ] && echo "$(wc -c < "$work/ticket.txt" | tr -d ' ') bytes" || echo none)"
   echo "verdict would be:  $(cfg_get '.verdictMode' comment) → (computed after findings)"
   echo
@@ -1185,11 +1188,12 @@ engine_base_init() {
   done
   # A clone killed mid-way (INT, TERM, SIGKILL, power loss) leaves its temp dir
   # beside the base, and nothing else reaps it. Holding the lock means no live
-  # init is using one.
-  rm -rf "$base".cloning-* 2>/dev/null
+  # init is using one. '+' is a character goblin_repo_dir strips, so this glob
+  # cannot match another repository's base (a repo named "x.cloning-5" could).
+  rm -rf "$base"+cloning-* 2>/dev/null
   if [ -d "$base/.git" ]; then lock_release "$lock"; return 0; fi
   log "  no local base for $slug yet — cloning it once from GitHub"
-  tmp="$base.cloning-$$"; cerr="${RUNTMP:-/tmp}/.clone-err-$$"
+  tmp="$base+cloning-$$"; cerr="${RUNTMP:-/tmp}/.clone-err-$$"
   rm -rf "$tmp"
   if ! git clone --quiet "https://github.com/$slug.git" "$tmp" 2>"$cerr"; then
     log "  base clone failed: $(head -c 200 "$cerr" 2>/dev/null)"

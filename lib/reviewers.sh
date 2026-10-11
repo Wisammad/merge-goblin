@@ -248,7 +248,8 @@ reviewers_plan_append() {
 # cursor logged a failure, backed the head off through attempt_record so it would
 # not be retried, and posted nothing — while codex sat there having completed.
 reviewers_run() {
-  local plan="$1" prompt="$2" dir="$3" work="$4" jobs="$work/reviewer-jobs" p override pid
+  local plan="$1" prompt="$2" dir="$3" work="$4" p override pid
+  local jobs="$work/reviewer-jobs"   # separate `local`: see reviewers_merge
   : > "$jobs"
   while IFS="$(printf '\t')" read -r p override; do
     [ -n "$p" ] || continue
@@ -317,7 +318,10 @@ EOF
 # Slurping norm-<p>.json unconditionally aborted the whole merge for a provider
 # that never wrote one, which turned one reviewer's absence into a total loss.
 reviewers_merge() {
-  local plan="$1" work="$2" out="$3" final="$4" merged="$work/merged-stage.json" p ok_any=false
+  local plan="$1" work="$2" out="$3" final="$4" p ok_any=false
+  # Separate statement: in one `local`, every value is expanded before any is
+  # assigned, so $work here was the CALLER's $work, not the argument.
+  local merged="$work/merged-stage.json"
   jq '. + {results:[]}' "$plan" > "$final"
   printf '{"schema_version":1,"summary":"","suggested_verdict":"comment","intent_notes":[],"findings":[]}' > "$merged"
 
@@ -339,9 +343,13 @@ reviewers_merge() {
 
     [ "$ok" = true ] || continue
     ok_any=true
-    jq --slurpfile r "$norm" --slurpfile m "$meta" --arg p "$p" '
+    # "independent" only when the plan says so: a self-review is flagged as one
+    # in the banner, and the heading under it must not contradict that.
+    jq --slurpfile r "$norm" --slurpfile m "$meta" --slurpfile pl "$plan" --arg p "$p" '
       .summary += (if .summary == "" then "" else "\n\n" end)
-        + "#### " + ($p | ascii_upcase) + " — independent review\n\n" + ($r[0].summary // "")
+        + "#### " + ($p | ascii_upcase)
+        + (if $pl[0].independent == false then " — review" else " — independent review" end)
+        + "\n\n" + ($r[0].summary // "")
       | .findings += [ $r[0].findings[]? + {reviewer:$p, reviewerModel:($m[0].model // $p)} ]
       | .intent_notes += [($r[0].intent_note // empty) + {reviewer:$p}]
     ' "$merged" > "$merged.next" && mv "$merged.next" "$merged"
