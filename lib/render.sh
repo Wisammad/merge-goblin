@@ -93,8 +93,10 @@ render_review_body() {
     # fallback: reviewers_plan also falls through that branch to whatever is
     # actually installed when Opus's companion is not available, and this
     # banner used to keep naming Opus regardless — false attribution on a
-    # posted review. modelOverride is only ever "opus" when that branch ran.
-    opus_used="$(jq -r '[.reviewers[]? | select(.modelOverride == "opus")] | length > 0' "$plan")"
+    # posted review. An opus override with no note is that branch; `goblin
+    # claude` also forces opus, but always explains itself in .note.
+    opus_used="$(jq -r '([.reviewers[]? | select(.modelOverride == "opus")] | length > 0)
+      and ((.note // "") == "")' "$plan")"
     signal="$(jq -r '.contributor.signal // ""' "$plan" | tr -d '\000-\037' | cut -c 1-180)"
     routed="$(jq -r '[.reviewers[] | "**" + .label + "** (`" + (.model // .provider) + "`)"] | join(" and ")' "$plan")"
     local contributors note independent failed

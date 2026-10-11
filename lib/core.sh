@@ -179,10 +179,14 @@ atomic_write() {
   return 1
 }
 
-# json_ok — stdin is one non-empty JSON value. Not bare `jq -e .`: on EMPTY input
-# Homebrew's jq exits 4 but Debian's jq 1.6 and Apple's jq exit 0, so a missing
-# file passed as valid JSON everywhere goblin was not running Homebrew's jq.
-json_ok() { local s; s="$(cat)"; [ -n "$s" ] && printf '%s' "$s" | jq -e . >/dev/null 2>&1; }
+# json_ok — stdin is one JSON value. Not bare `jq -e .`: on input with no value
+# in it (empty, or only whitespace) Debian's jq 1.6 exits 0, so a missing or
+# blank file passed as valid JSON there.
+json_ok() {
+  local s; s="$(cat)"
+  case "$s" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s' "$s" | jq -e . >/dev/null 2>&1
+}
 
 # Portable lowercase (bash 3.2 has no ${x,,}).
 lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }

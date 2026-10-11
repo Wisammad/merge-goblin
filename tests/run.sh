@@ -976,6 +976,7 @@ test_claude_effort_is_passed_only_when_set() (
 test_json_ok_rejects_empty() (
   . "$ROOT/lib/core.sh"
   printf '' | json_ok && { echo "empty input passed as JSON"; return 1; }
+  printf '\n  \n' | json_ok && { echo "whitespace passed as JSON"; return 1; }
   printf 'not json' | json_ok && { echo "garbage passed as JSON"; return 1; }
   printf '{"a":1}' | json_ok || { echo "a real object was rejected"; return 1; }
 )
@@ -1121,6 +1122,24 @@ JSON
     'codex' 'codex/gpt-test' me "$GOBLIN_HOME/files.json" COMMENT "$GOBLIN_HOME/plan2.json")"
   printf '%s' "$body" | grep -qF 'Not an independent review' \
     || { echo "a self-review was presented as an independent one"; return 1; }
+  teardown
+}
+
+test_render_only_claude_is_not_the_fallback() {
+  setup
+  . "$ROOT/lib/render.sh"
+  echo '{"summary":"s","findings":[]}' > "$GOBLIN_HOME/norm.json"
+  echo '{"inline":[],"demoted":[]}' > "$GOBLIN_HOME/split.json"
+  echo '[{"additions":1,"deletions":0}]' > "$GOBLIN_HOME/files.json"
+  local plan='{"contributor":{"detected":false},"contributors":[],"independent":true,"reviewers":[{"provider":"claude","label":"Claude Opus 5","modelOverride":"opus","model":"opus","ok":true,"error":""}]}' body
+  printf '%s' "$plan" | jq '.note = "Claude Opus 5 was requested as the only reviewer"' > "$GOBLIN_HOME/plan.json"
+  body="$(render_review_body "$GOBLIN_HOME/norm.json" "$GOBLIN_HOME/split.json" 7 abc main \
+    claude claude/opus me "$GOBLIN_HOME/files.json" COMMENT "$GOBLIN_HOME/plan.json")"
+  printf '%s' "$body" | grep -q 'fallback route' && { echo "goblin claude was posted as the fallback route"; return 1; }
+  printf '%s' "$plan" | jq '.note = ""' > "$GOBLIN_HOME/plan.json"
+  body="$(render_review_body "$GOBLIN_HOME/norm.json" "$GOBLIN_HOME/split.json" 7 abc main \
+    claude claude/opus me "$GOBLIN_HOME/files.json" COMMENT "$GOBLIN_HOME/plan.json")"
+  printf '%s' "$body" | grep -q 'fallback route' || { echo "the real fallback lost its banner"; return 1; }
   teardown
 }
 
@@ -1760,6 +1779,30 @@ test_sweep_summary_totals_by_severity() (
   out="$(engine_sweep acme/repo 42 2>&1)"
   printf '%s\n' "$out" | grep -q 'totals     no findings across 1 pass(es)' \
     || { echo "clean sweep line wrong:"; printf '%s\n' "$out" | grep totals; return 1; }
+  teardown
+)
+
+test_interrupt_stops_the_run() {
+  # Cleanup belongs to EXIT only; INT/TERM must exit (which runs it). A trap that
+  # cleaned up on INT without exiting deleted the live review and carried on.
+  grep -qE "^  trap '[^']*engine_checkout_release[^']*' EXIT$" "$ROOT/lib/engine.sh" \
+    || { echo "cleanup trap is not EXIT-only"; return 1; }
+  grep -qE "^  trap 'exit 130' INT$" "$ROOT/lib/engine.sh" || { echo "INT does not exit"; return 1; }
+  grep -qE "^  trap 'exit 143' TERM$" "$ROOT/lib/engine.sh" || { echo "TERM does not exit"; return 1; }
+  # And the behaviour, in bash itself: INT exits and EXIT cleans up once.
+  local out; out="$(bash -c "trap 'echo cleaned' EXIT; trap 'exit 130' INT; kill -INT \$\$; echo carried-on")"
+  eq "cleaned" "$out" || return 1
+}
+
+test_sweep_files_are_per_pr() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local paths="$GOBLIN_HOME/paths"; : > "$paths"
+  # Fanout workers are background jobs of one shell: same $$, different PRs.
+  engine_sweep_pass() { echo "$3" >> "$paths"; sweep_stub_pass "$@"; }
+  sweep_script 0; engine_sweep acme/repo 41 >/dev/null 2>&1
+  sweep_script 0; engine_sweep acme/repo 42 >/dev/null 2>&1
+  eq "2" "$(sort -u "$paths" | wc -l | tr -d ' ')" || { echo "two PRs' sweeps shared a result file"; return 1; }
   teardown
 )
 
@@ -2774,6 +2817,9 @@ t "reviewers: no-signature plan respects availability" test_no_signature_plan_st
 t "reviewers: contributor signal strips backticks" test_contributor_signal_strips_backticks
 t "reviewers: one failure is survivable"   test_reviewers_survive_one_failure
 t "reviewers: spare tried when all fail"   test_reviewers_fallback_to_spare_provider
+t "engine: interrupt stops the run"     test_interrupt_stops_the_run
+t "render: goblin claude is not the fallback" test_render_only_claude_is_not_the_fallback
+t "sweep: result files are per PR"      test_sweep_files_are_per_pr
 t "sweep: one-line totals by severity"    test_sweep_summary_totals_by_severity
 t "engine: base refresh fetches after waiting" test_base_refresh_fetches_after_waiting
 t "engine: base init reaps killed clones"  test_base_init_reaps_killed_clones
