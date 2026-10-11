@@ -17,7 +17,7 @@ findings_extract() {
   awk 'BEGIN{inb=0}
        /^[[:space:]]*```/ { inb = !inb; next }
        inb { print }' "$src" > "$tmp" 2>/dev/null
-  if [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then mv "$tmp" "$out"; return 0; fi
+  if json_ok < "$tmp"; then mv "$tmp" "$out"; return 0; fi
 
   # Widest brace span, sliced by CHARACTER not by line: models routinely put the
   # preamble on the same line as the JSON ("I'll review the diff...{...}"), which
@@ -25,7 +25,7 @@ findings_extract() {
   perl -0777 -ne 'my $i = index($_, "{"); my $j = rindex($_, "}");
                   print substr($_, $i, $j - $i + 1) if $i >= 0 && $j > $i;' \
     "$src" > "$tmp" 2>/dev/null
-  if [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then mv "$tmp" "$out"; return 0; fi
+  if json_ok < "$tmp"; then mv "$tmp" "$out"; return 0; fi
 
   # First complete object from the first "{", ignoring whatever follows. The
   # widest span above includes any stray trailing brace: cursor-agent returned a
@@ -33,7 +33,7 @@ findings_extract() {
   # and both attempts were thrown away as "invalid output" over that one byte.
   perl -0777 -ne 'my $i = index($_, "{"); print substr($_, $i) if $i >= 0;' \
     "$src" 2>/dev/null | jq -n 'input | objects' > "$tmp" 2>/dev/null
-  if [ -s "$tmp" ] && jq -e . "$tmp" >/dev/null 2>&1; then mv "$tmp" "$out"; return 0; fi
+  if json_ok < "$tmp"; then mv "$tmp" "$out"; return 0; fi
 
   rm -f "$tmp" 2>/dev/null
   return 1

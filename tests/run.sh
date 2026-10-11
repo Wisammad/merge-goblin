@@ -405,6 +405,46 @@ test_verdict_is_clamped_to_comment() {
   teardown
 }
 
+test_findings_extract_skips_a_blank_fence() {
+  setup
+  . "$ROOT/lib/findings.sh"
+  # A blank fence before the real JSON: on jq 1.6 its whitespace passed as JSON.
+  printf 'Here:\n```\n\n```\n{"findings":[{"severity":"risk"}]}\n' > "$GOBLIN_HOME/raw.txt"
+  findings_extract "$GOBLIN_HOME/raw.txt" "$GOBLIN_HOME/out.json" || return 1
+  eq "1" "$(jq '.findings | length' "$GOBLIN_HOME/out.json" 2>/dev/null)" \
+    || { echo "a blank fence was taken as the review"; return 1; }
+  teardown
+}
+
+test_dry_run_names_rules_from_the_pr_checkout() (
+  setup
+  . "$ROOT/lib/engine.sh"
+  local w="$GOBLIN_HOME/w" pr_tree="$GOBLIN_HOME/pr-tree" out
+  mkdir -p "$w" "$pr_tree/.goblin" "$(goblin_repo_dir acme/repo)"
+  echo '{"contributor":{"detected":false},"reviewers":[{"label":"X"}]}' > "$w/review-plan.json"
+  : > "$w/prompt.txt"; : > "$w/diff.txt"; echo '[]' > "$w/files.json"; echo '[]' > "$w/addr.json"
+  echo '{"promptPath":"PR_RULES.md"}' > "$pr_tree/.goblin/config.json"; echo r > "$pr_tree/PR_RULES.md"
+  out="$(engine_dry_run "$w" acme/repo 1 abc main claude "$pr_tree")"
+  printf '%s' "$out" | grep -q 'review rules from: PR_RULES.md' \
+    || { echo "dry run did not read rules from the PR checkout"; printf '%s\n' "$out" | grep 'rules from'; return 1; }
+  teardown
+)
+
+test_merge_heading_follows_independence() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  local w="$GOBLIN_HOME/w"; mkdir -p "$w"
+  echo '{"independent":false,"note":"x","reviewers":[{"provider":"codex","label":"OpenAI Codex"}]}' > "$w/plan.json"
+  echo '{"ok":true,"model":"m"}' > "$w/meta-codex.json"
+  echo '{"summary":"s","findings":[]}' > "$w/norm-codex.json"
+  reviewers_merge "$w/plan.json" "$w" "$w/out.json" "$w/final.json" >/dev/null 2>&1
+  jq -r '.summary' "$w/out.json" 2>/dev/null | grep -q 'independent review' \
+    && { echo "a self-review was titled independent"; return 1; }
+  jq -r '.summary' "$w/out.json" 2>/dev/null | grep -q '#### CODEX — review' \
+    || { echo "heading missing:"; cat "$w/out.json"; return 1; }
+  teardown
+)
+
 test_findings_extract_from_fenced_prose() {
   setup
   . "$ROOT/lib/findings.sh"
@@ -2116,9 +2156,9 @@ test_base_init_reaps_killed_clones() (
   setup
   . "$ROOT/lib/engine.sh"
   local base="$GOBLIN_HOME/repos/acme/repo"
-  mkdir -p "$base/.git" "$base.cloning-99999/.git"
+  mkdir -p "$base/.git" "$base+cloning-99999/.git"
   engine_base_init acme/repo "$base" || return 1
-  [ -d "$base.cloning-99999" ] && { echo "a killed clone's temp dir was left behind"; return 1; }
+  [ -d "$base+cloning-99999" ] && { echo "a killed clone's temp dir was left behind"; return 1; }
   [ -d "$base/.git" ] || { echo "the base itself was removed"; return 1; }
   teardown
 )
@@ -2142,7 +2182,7 @@ test_first_base_clone_is_serialised() (
   wait "$b" || { echo "worker 2 failed"; return 1; }
   eq "1" "$(wc -l < "$clones" | tr -d ' ')" || { echo "both workers cloned the base"; return 1; }
   eq "ok" "$(cat "$base/.git/HEAD")" || { echo "base is not a whole clone"; return 1; }
-  ls -d "$base".cloning-* 2>/dev/null && { echo "temp clone left behind"; return 1; }
+  ls -d "$base"+cloning-* 2>/dev/null && { echo "temp clone left behind"; return 1; }
   teardown
 )
 
@@ -2834,6 +2874,9 @@ t "fleet: empty fleet"                   test_assignment_empty_fleet
 t "agent: label is per-user"             test_agent_label_is_per_user
 t "migrate: preserves ledger + events"   test_migrate_preserves_ledger_and_events
 t "providers: claude effort only when set" test_claude_effort_is_passed_only_when_set
+t "findings: a blank fence is not the review" test_findings_extract_skips_a_blank_fence
+t "dry run: rules come from the PR checkout" test_dry_run_names_rules_from_the_pr_checkout
+t "merge: heading follows independence"    test_merge_heading_follows_independence
 t "core: json_ok rejects empty input"     test_json_ok_rejects_empty
 t "ui: state cache is valid json"        test_ui_state_is_valid_json
 t "ui: serves, refuses bad token"        test_ui_serves_and_refuses_bad_token

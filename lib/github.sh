@@ -29,7 +29,8 @@ gh_prs() {
 # active GitHub account. Search supplies repo/number pairs; the pull endpoint
 # supplies the current head and the same normalized shape as gh_prs.
 gh_user_prs() {
-  local login="$1" out="$2" search="$RUNTMP/user-pr-search-$$.json" rows="$out.rows"
+  local login="$1" out="$2" search="$RUNTMP/user-pr-search-$$.json"
+  local rows="$out.rows"   # separate `local`: one statement expands before assigning
   : > "$rows"
 
   gh api --paginate --slurp -X GET search/issues \
