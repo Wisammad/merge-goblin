@@ -84,7 +84,13 @@ cmd_run() {
   # reservation_release here is a crash-safety net, not the primary release —
   # the per-PR loops in engine_repo/engine_user_scope release explicitly after
   # every PR so a sweep never holds one PR's slot into the next.
-  trap 'claim_release; claim_release_comment; engine_checkout_release; pr_lock_release; reservation_release; engine_run_lock_release' EXIT INT TERM
+  # Cleanup runs once, on EXIT. INT/TERM only exit — which fires the EXIT trap.
+  # A trap on INT/TERM that cleaned up without exiting deleted the live review's
+  # scratch and then let the run carry on against it. (No `exit` inside the EXIT
+  # trap itself: bash 3.2 re-enters it.)
+  trap 'claim_release; claim_release_comment; engine_checkout_release; pr_lock_release; reservation_release; engine_run_lock_release' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   log "=== run start ${ONLY_PR:+(pr #$ONLY_PR) }${DRY_RUN:+}$([ "$DRY_RUN" = true ] && echo '(dry run)')"
 
@@ -241,10 +247,13 @@ engine_sweep() {
   case "$max" in ''|*[!0-9]*) max=5 ;; esac
   [ "$max" -lt 1 ] && max=1
 
-  result="$RUNTMP/sweep-$$.json"
-  seen="$RUNTMP/sweep-seen-$$.json"; echo '[]' > "$seen"
+  # Keyed on the PR as well as $$: fanout workers are background jobs of one
+  # shell, and in bash a background job's $$ is still the parent's pid, so $$
+  # alone gave every worker the same files.
+  result="$RUNTMP/sweep-$pr-$$.json"
+  seen="$RUNTMP/sweep-seen-$pr-$$.json"; echo '[]' > "$seen"
   # Every finding new to THIS sweep, with its severity, for the one-line total.
-  SWEEP_FOUND="$RUNTMP/sweep-found-$$.json"; echo '[]' > "$SWEEP_FOUND"
+  SWEEP_FOUND="$RUNTMP/sweep-found-$pr-$$.json"; echo '[]' > "$SWEEP_FOUND"
 
   # Each pass is a separate review with its own fresh copy (engine_checkout_dir).
   local sweep_started per_pass=""
