@@ -600,6 +600,16 @@ JSON
     || { echo "reviewers shared one checkout"; return 1; }
   jq -e '.ok and .model == "codex-model"' "$work/meta-codex.json" >/dev/null || return 1
   jq -e '.ok and .model == "cursor-model"' "$work/meta-cursor.json" >/dev/null || return 1
+
+  # Each reviewer's time is kept, a failed one's too, and reaches events.jsonl.
+  findings_run() { GOBLIN_P_ERRKIND=quota; GOBLIN_P_ERRMSG="out of usage"; return 1; }
+  reviewer_run_one cursor "" "$work/prompt" "$work" "$work" && return 1
+  eq '[{"provider":"codex","ok":true},{"provider":"cursor","ok":false}]' \
+    "$(reviewers_timings "$work" | jq -c 'map({provider, ok})')" || return 1
+  eq "codex 0s ok, cursor 0s failed" "$(reviewers_timings "$work" text)" || return 1
+  events_append failed 7 t u 0 reviewer_failure o/r codex+cursor m "$(reviewers_timings "$work")"
+  jq -e 'select(.number == 7) | .reviewers | length == 2 and all(.durationMs | type == "number")' \
+    "$EVENTS" >/dev/null || { echo "reviewer times did not reach events.jsonl"; return 1; }
   teardown
 )
 

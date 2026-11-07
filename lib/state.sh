@@ -181,17 +181,17 @@ status_set() {
   fi
 }
 
-# events_append <status> <number> <title> <url> <cost> <reason> [repo] [provider] [model]
+# events_append <status> <number> <title> <url> <cost> <reason> [repo] [provider] [model] [reviewers-json]
 events_append() {
   local evstatus="$1" number="$2" title="$3" url="$4" cost="${5:-0}" reason="${6:-}"
-  local repo="${7:-}" provider="${8:-}" model="${9:-}"
+  local repo="${7:-}" provider="${8:-}" model="${9:-}" reviewers="${10:-[]}"
   goblin_ensure_dirs
   jq -nc --arg st "$evstatus" --argjson n "${number:-0}" --arg t "$title" \
      --arg u "$url" --argjson c "${cost:-0}" --arg r "$reason" \
-     --arg repo "$repo" --arg p "$provider" --arg m "$model" \
+     --arg repo "$repo" --arg p "$provider" --arg m "$model" --argjson rv "$reviewers" \
      --argjson at "$(now_epoch)" \
      '{at:$at, number:$n, title:$t, url:$u, costUsd:$c, status:$st, reason:$r,
-       repo:$repo, provider:$p, model:$m}' >> "$EVENTS" 2>/dev/null || true
+       repo:$repo, provider:$p, model:$m, reviewers:$rv}' >> "$EVENTS" 2>/dev/null || true
 }
 
 ledger_has()  { grep -qxF "$1" "$LEDGER" 2>/dev/null; }
