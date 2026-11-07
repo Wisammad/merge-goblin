@@ -606,7 +606,9 @@ JSON
   reviewer_run_one cursor "" "$work/prompt" "$work" "$work" && return 1
   eq '[{"provider":"codex","ok":true},{"provider":"cursor","ok":false}]' \
     "$(reviewers_timings "$work" | jq -c 'map({provider, ok})')" || return 1
-  eq "codex 0s ok, cursor 0s failed" "$(reviewers_timings "$work" text)" || return 1
+  # Real seconds: the codex stub above waits for cursor to start, so it can cross one.
+  reviewers_timings "$work" text | grep -Eqx 'codex [0-9]+s ok, cursor [0-9]+s failed' \
+    || { echo "unexpected timings line: $(reviewers_timings "$work" text)"; return 1; }
   events_append failed 7 t u 0 reviewer_failure o/r codex+cursor m "$(reviewers_timings "$work")"
   jq -e 'select(.number == 7) | .reviewers | length == 2 and all(.durationMs | type == "number")' \
     "$EVENTS" >/dev/null || { echo "reviewer times did not reach events.jsonl"; return 1; }
