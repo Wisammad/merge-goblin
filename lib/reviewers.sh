@@ -155,15 +155,28 @@ reviewer_run_one() {
   if [ -n "$override" ]; then export GOBLIN_MODEL_OVERRIDE="$override"
   else unset GOBLIN_MODEL_OVERRIDE
   fi
+  # Timed here, around findings_run, so a failed run and any retry inside it count too.
+  local t0; t0="$(now_epoch)"
   if findings_run "$provider" "$prompt" "$dir" "$out" "$raw"; then
     jq -n --arg p "$provider" --arg m "${GOBLIN_P_MODEL:-$provider}" \
-      --argjson cost "${GOBLIN_P_COST_USD:-0}" --argjson ms "${GOBLIN_P_DURATION_MS:-0}" \
+      --argjson cost "${GOBLIN_P_COST_USD:-0}" --argjson ms "$(( ($(now_epoch) - t0) * 1000 ))" \
       '{provider:$p,ok:true,model:$m,costUsd:$cost,durationMs:$ms}' > "$meta"
     return 0
   fi
   jq -n --arg p "$provider" --arg e "${GOBLIN_P_ERRMSG:-review failed}" \
-    --arg k "${GOBLIN_P_ERRKIND:-other}" '{provider:$p,ok:false,kind:$k,error:$e}' > "$meta"
+    --arg k "${GOBLIN_P_ERRKIND:-other}" --argjson ms "$(( ($(now_epoch) - t0) * 1000 ))" \
+    '{provider:$p,ok:false,kind:$k,error:$e,durationMs:$ms}' > "$meta"
   return 1
+}
+
+# reviewers_timings <work-dir> [text] — each reviewer, whether it answered and how
+# long it took: JSON for events.jsonl, or one line for the log with `text`.
+reviewers_timings() {
+  if [ "${2:-}" = text ]; then
+    jq -rs 'map("\(.provider) \(if .durationMs then "\(.durationMs / 1000 | floor)s" else "not run" end) \(if .ok then "ok" else "failed" end)") | join(", ")' "$1"/meta-*.json
+  else
+    jq -cs 'map({provider, ok, durationMs})' "$1"/meta-*.json
+  fi
 }
 
 reviewer_checkout() {

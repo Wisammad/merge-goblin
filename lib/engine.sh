@@ -974,12 +974,13 @@ engine_review_pr() {
     local kind="reviewer_failure" errors
     errors="$(jq -rs '[.[] | select(.ok != true) | (.provider + ": " + (.error // "failed"))] | join("; ")' "$work"/meta-*.json 2>/dev/null)"
     log "  #$pr: independent review failed ${errors:+($errors)}"
+    log "  #$pr: reviewers: $(reviewers_timings "$work" text)"
     # Keep the evidence. Without this a failure is unreproducible — you'd have
     # to pay for another review just to see what the model actually said.
     rm -rf "$GOBLIN_HOME/last-failure"
     cp -R "$work" "$GOBLIN_HOME/last-failure" 2>/dev/null \
       && log "  #$pr: raw output kept at $GOBLIN_HOME/last-failure"
-    events_append failed "$pr" "$title" "$url" 0 "$kind" "$slug" "$provider" "$reviewer_names"
+    events_append failed "$pr" "$title" "$url" 0 "$kind" "$slug" "$provider" "$reviewer_names" "$(reviewers_timings "$work")"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — $kind"
     gh_status "$slug" "$head" error "review failed: $kind"
     attempt_record "${slug}#${pr}:${head}" "$kind"
@@ -987,6 +988,7 @@ engine_review_pr() {
     engine_pass_write "the review itself failed${errors:+ ($errors)}" 0 "$head"
     rm -rf "$work"; return 1
   fi
+  log "  #$pr: reviewers: $(reviewers_timings "$work" text)"
 
   # 6. drop findings that were already posted and still stand
   if [ -s "$prior_json" ] && [ "$(jq 'length' "$prior_json")" != "0" ]; then
@@ -1025,7 +1027,7 @@ engine_publish() {
                      "$provider" "$model" "$GOBLIN_LOGIN" "$work/files.json" "$event" "$plan" > "$work/body.md"
   if ! post_build_review "$work/split.json" "$work/body.md" "$head" "$event" \
                          "$provider" "$model" "$pr" "$work/review.json"; then
-    events_append failed "$pr" "$title" "$url" "$cost" "payload incomplete" "$slug" "$provider" "$model"
+    events_append failed "$pr" "$title" "$url" "$cost" "payload incomplete" "$slug" "$provider" "$model" "$(reviewers_timings "$work")"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — review payload was incomplete"
     gh_status "$slug" "$head" error "review payload was incomplete"
     attempt_record "${slug}#${pr}:${head}" "payload"
@@ -1049,7 +1051,7 @@ engine_publish() {
     rm -rf "$GOBLIN_HOME/last-failure"
     cp -R "$work" "$GOBLIN_HOME/last-failure" 2>/dev/null \
       && log "  #$pr: failed payload kept at $GOBLIN_HOME/last-failure"
-    events_append failed "$pr" "$title" "$url" "$cost" "post failed" "$slug" "$provider" "$model"
+    events_append failed "$pr" "$title" "$url" "$cost" "post failed" "$slug" "$provider" "$model" "$(reviewers_timings "$work")"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — could not post review"
     gh_status "$slug" "$head" error "could not post review"
     attempt_record "${slug}#${pr}:${head}" "post"
@@ -1093,7 +1095,7 @@ engine_publish() {
     "$(jq '.findings | length' "$work/norm.json" 2>/dev/null || echo 0)" "$head" \
     "$(jq -c '[.findings[].id]' "$work/norm.json" 2>/dev/null || echo '[]')" \
     "$(jq -c '[.findings[] | {id, severity}]' "$work/norm.json" 2>/dev/null || echo '[]')"
-  events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model"
+  events_append posted "$pr" "$title" "$url" "$cost" "" "$slug" "$provider" "$model" "$(reviewers_timings "$work")"
   # The moment the posted event exists, today_review_count sees it — holding
   # the reservation any longer double-counts this same review as both
   # reserved AND posted, which can refuse a concurrent audit that is actually
