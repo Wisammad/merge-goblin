@@ -1027,7 +1027,7 @@ engine_publish() {
                      "$provider" "$model" "$GOBLIN_LOGIN" "$work/files.json" "$event" "$plan" > "$work/body.md"
   if ! post_build_review "$work/split.json" "$work/body.md" "$head" "$event" \
                          "$provider" "$model" "$pr" "$work/review.json"; then
-    events_append failed "$pr" "$title" "$url" "$cost" "payload incomplete" "$slug" "$provider" "$model"
+    events_append failed "$pr" "$title" "$url" "$cost" "payload incomplete" "$slug" "$provider" "$model" "$(reviewers_timings "$work")"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — review payload was incomplete"
     gh_status "$slug" "$head" error "review payload was incomplete"
     attempt_record "${slug}#${pr}:${head}" "payload"
@@ -1051,7 +1051,7 @@ engine_publish() {
     rm -rf "$GOBLIN_HOME/last-failure"
     cp -R "$work" "$GOBLIN_HOME/last-failure" 2>/dev/null \
       && log "  #$pr: failed payload kept at $GOBLIN_HOME/last-failure"
-    events_append failed "$pr" "$title" "$url" "$cost" "post failed" "$slug" "$provider" "$model"
+    events_append failed "$pr" "$title" "$url" "$cost" "post failed" "$slug" "$provider" "$model" "$(reviewers_timings "$work")"
     notify failed "$GOBLIN_NAME failed ⚠️" "#$pr — could not post review"
     gh_status "$slug" "$head" error "could not post review"
     attempt_record "${slug}#${pr}:${head}" "post"

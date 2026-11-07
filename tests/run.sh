@@ -612,6 +612,9 @@ JSON
   events_append failed 7 t u 0 reviewer_failure o/r codex+cursor m "$(reviewers_timings "$work")"
   jq -e 'select(.number == 7) | .reviewers | length == 2 and all(.durationMs | type == "number")' \
     "$EVENTS" >/dev/null || { echo "reviewer times did not reach events.jsonl"; return 1; }
+  # Every event the engine writes carries them, failures after the review included.
+  [ "$(grep -c 'events_append ' "$ROOT/lib/engine.sh")" = "$(grep -c 'events_append .*reviewers_timings "$work")"$' "$ROOT/lib/engine.sh")" ] \
+    || { echo "an events_append in engine.sh does not pass the reviewer times"; return 1; }
   teardown
 )
 
