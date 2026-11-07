@@ -562,8 +562,14 @@ test_reviewer_routing_from_contributor_signatures() (
   echo 'ordinary human commit' > "$evidence"
   reviewers_plan "$evidence" "$plan"
   eq "false" "$(jq -r '.contributor.detected' "$plan")" || return 1
-  eq "claude:opus codex:" \
+  eq "claude:opus codex: cursor:" \
     "$(jq -r '.reviewers[] | .provider + ":" + .modelOverride' "$plan" | paste -sd' ' -)" || return 1
+
+  # No cap: every available reviewer that did not write the PR runs.
+  provider_opencode_probe() { echo '{"name":"opencode","available":true,"authed":true}'; }
+  echo 'Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>' > "$evidence"
+  reviewers_plan "$evidence" "$plan"
+  eq "codex cursor opencode" "$(jq -r '.reviewers[].provider' "$plan" | paste -sd' ' -)" || return 1
   teardown
 )
 

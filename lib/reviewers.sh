@@ -72,7 +72,7 @@ reviewers_plan() {
 
   local n_ind=0; for p in $independent; do n_ind=$((n_ind + 1)); done
 
-  local reviewers="" overrides='' note='' is_independent=true fallback
+  local reviewers="" overrides='' note='' is_independent=true
   local only="${GOBLIN_ONLY_REVIEWER:-}"
 
   if [ -n "$only" ]; then
@@ -85,32 +85,16 @@ reviewers_plan() {
       *) note="$(reviewer_label "$only") was requested as the only reviewer" ;;
     esac
   elif [ -z "$contributors" ]; then
-    # Nothing to exclude. Prefer Claude Opus plus the configured companion —
-    # but only when BOTH are actually installed and authed. Hardcoding this
-    # pair regardless of `avail` reintroduced the exact failure the
-    # availability filter above exists to prevent: a machine configured for
-    # cursor that is signed out, with codex actually installed, planned
-    # "claude cursor", both probes failed, and codex was never asked.
-    fallback="$(cfg_get '.provider' 'codex')"
-    [ "$fallback" = claude ] && fallback=codex
-    local pref="claude $fallback" pref_n=0 pp
-    for pp in $pref; do case " $avail " in *" $pp "*) pref_n=$((pref_n + 1)) ;; esac; done
-    if [ "$pref_n" -ge 2 ]; then
-      reviewers="$pref"; overrides='claude=opus'
-    fi
-    # Otherwise fall through to the general, availability-aware logic below —
-    # `independent` already is every available provider here, since nothing
-    # was excluded.
+    # Nothing to exclude: every available provider reviews (below), Claude as Opus.
+    overrides='claude=opus'
   fi
 
   if [ -n "$reviewers" ]; then
-    true  # the preferred pair above was fully available; nothing left to decide
+    true  # the one reviewer asked for by name
   elif [ "$n_ind" -ge 2 ]; then
-    # At most two reviewers ever run in parallel. When a contributor was
-    # excluded, `independent` already has at most two members; when nothing
-    # was (the branch above), it can be all three available providers and
-    # must still be capped here.
-    reviewers="$(printf '%s\n' $independent | head -2 | paste -sd' ' -)"
+    # Every available reviewer that did not write the PR runs, in parallel.
+    # reviewers_run waits for all of them, so the slowest one sets the pace.
+    reviewers="$independent"
   elif [ "$n_ind" -eq 1 ]; then
     reviewers="$independent"
     note="only $(reviewer_label "$independent") is both independent and available here, so it reviewed alone"
