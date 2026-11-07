@@ -45,7 +45,7 @@ providers_report() {
   local cur; cur="$(cfg_get '.provider' 'claude')"
   providers_probe_all | jq -r --arg cur "$cur" '.[] |
     (if .name == $cur then "▸ " else "  " end) +
-    (.name | . + (" " * (8 - length))) +
+    (.name | . + (" " * (9 - length))) +
     (if .available then (if .authed then "ready  " else "no auth" end) else "missing" end) +
     "  " + ((.authMode // "") | .[0:14] | . + (" " * (16 - length))) +
     (if .costKnown then "cost: yes" else "cost: n/a" end) +
