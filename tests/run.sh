@@ -542,6 +542,7 @@ test_reviewer_routing_from_contributor_signatures() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   echo 'Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>' > "$evidence"
   reviewers_plan "$evidence" "$plan"
@@ -573,6 +574,7 @@ test_reviewers_start_in_parallel() (
   mkdir -p "$work"; : > "$starts"
   provider_codex_probe()  { echo '{"available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   findings_run() {
     local p="$1" out="$4" i=0
     printf '%s:%s\n' "$p" "$3" >> "$starts"
@@ -675,6 +677,7 @@ test_every_contributor_is_excluded() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   # Two agents co-authored this branch. Excluding only the top scorer sent the
   # review straight back to the other one — and on a tie the "top" scorer was
@@ -699,6 +702,7 @@ test_all_agents_contributed_is_disclosed() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   # Nothing independent is available. Reviewing anyway is right — silently
   # calling the result independent is not.
@@ -709,7 +713,7 @@ test_all_agents_contributed_is_disclosed() (
   eq "1" "$(jq '.reviewers | length' "$plan")" || return 1
   # The least-involved agent reviews: cursor has one signature, the others two.
   eq "cursor" "$(jq -r '.reviewers[0].provider' "$plan")" || return 1
-  jq -e '.note | test("not independent|reviewing its own work")' "$plan" >/dev/null \
+  jq -e '.note | test("not (an )?independent|reviewing its own work")' "$plan" >/dev/null \
     || { echo "a self-review was not disclosed as one"; return 1; }
   teardown
 )
@@ -727,6 +731,7 @@ test_no_signature_plan_still_respects_availability() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   echo 'ordinary human commit' > "$evidence"
   reviewers_plan "$evidence" "$plan"
@@ -743,6 +748,7 @@ test_contributor_signal_strips_backticks() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   # The signal is the PR title/body/branch/commit text, which the PR author
   # controls. render.sh wraps it in one backtick span; an embedded backtick
   # closes that span early and lets the rest render as live Markdown inside a
@@ -765,6 +771,7 @@ test_independent_reviewer_must_be_installed() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":false,"authed":false}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n' > "$evidence"
   reviewers_plan "$evidence" "$plan"
@@ -787,6 +794,7 @@ test_independent_and_available_reviewer_is_used() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":false,"authed":false}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   printf 'Co-Authored-By: Claude <noreply@anthropic.com>\n' > "$evidence"
   reviewers_plan "$evidence" "$plan"
@@ -803,6 +811,7 @@ test_reviewers_survive_one_failure() (
   provider_codex_probe()  { echo '{"available":true,"authed":true}'; }
   # cursor missing — exactly the two-CLI machine this feature ships onto.
   provider_cursor_probe() { echo '{"available":false,"authed":false,"note":"cursor-agent not installed"}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   findings_run() {
     local p="$1" out="$4"
     printf '{"summary":"%s review","findings":[{"id":"x","severity":"blocker","title":"Real bug","body":"%s found it","path":"a.ts","line":3}],"intent_note":null}\n' "$p" "$p" > "$out"
@@ -830,6 +839,7 @@ test_zero_reviewers_is_still_a_failure() (
   local work="$GOBLIN_HOME/work"; mkdir -p "$work"
   provider_codex_probe()  { echo '{"available":false,"authed":false,"note":"no codex"}'; }
   provider_cursor_probe() { echo '{"available":false,"authed":false,"note":"no cursor"}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   cat > "$work/plan.json" <<'JSON'
 {"reviewers":[{"provider":"codex","label":"OpenAI Codex","modelOverride":""},{"provider":"cursor","label":"Cursor","modelOverride":""}]}
 JSON
@@ -850,6 +860,7 @@ test_reviewers_fallback_to_spare_provider() (
   provider_claude_probe()  { echo '{"available":true,"authed":true}'; }
   provider_codex_probe()   { echo '{"available":true,"authed":true}'; }
   provider_cursor_probe()  { echo '{"available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   findings_run() {
     local p="$1" out="$4"
     case "$p" in
@@ -885,6 +896,7 @@ test_only_reviewer_is_the_whole_plan() (
   provider_claude_probe() { echo '{"name":"claude","available":true,"authed":true}'; }
   provider_codex_probe()  { echo '{"name":"codex","available":true,"authed":true}'; }
   provider_cursor_probe() { echo '{"name":"cursor","available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
 
   echo 'ordinary human commit' > "$evidence"
   GOBLIN_ONLY_REVIEWER=cursor reviewers_plan "$evidence" "$plan"
@@ -911,6 +923,7 @@ test_only_reviewer_gets_no_spare() (
   provider_claude_probe()  { echo '{"available":true,"authed":true}'; }
   provider_codex_probe()   { echo '{"available":true,"authed":true}'; }
   provider_cursor_probe()  { echo '{"available":true,"authed":true}'; }
+  provider_opencode_probe() { echo '{"name":"opencode","available":false,"authed":false}'; }
   findings_run() { GOBLIN_P_ERRKIND=quota; GOBLIN_P_ERRMSG="out of usage"; return 1; }
   cat > "$work/plan.json" <<'JSON'
 {"contributor":{"detected":false,"provider":"","label":"","matches":0,"signal":""},"contributors":[],"independent":true,"note":"","reviewers":[{"provider":"codex","label":"OpenAI Codex","modelOverride":""}]}

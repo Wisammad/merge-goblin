@@ -84,11 +84,13 @@ found=""
 command -v claude       >/dev/null 2>&1 && { ok "claude";       found="$found claude"; }
 command -v codex        >/dev/null 2>&1 && { ok "codex";        found="$found codex"; }
 command -v cursor-agent >/dev/null 2>&1 && { ok "cursor-agent"; found="$found cursor"; }
+command -v opencode     >/dev/null 2>&1 && { ok "opencode";     found="$found opencode"; }
 if [ -z "$found" ]; then
   err "no AI CLI found. install at least one:"
   say  "      claude  →  https://claude.ai/code"
   say  "      codex   →  npm i -g @openai/codex   (then: codex login)"
   say  "      cursor  →  curl https://cursor.com/install -fsS | bash"
+  say  "      opencode →  curl -fsSL https://opencode.ai/install | bash"
   exit 1
 fi
 DEFAULT_PROVIDER="$(printf '%s' "$found" | awk '{print $1}')"

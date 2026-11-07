@@ -17,7 +17,8 @@ goblin_default_config() {
   "providers": {
     "claude": { "model": "opus", "bin": "" },
     "codex":  { "model": "", "reasoningEffort": "medium", "bin": "" },
-    "cursor": { "model": "$GOBLIN_CURSOR_DEFAULT_MODEL", "bin": "" }
+    "cursor": { "model": "$GOBLIN_CURSOR_DEFAULT_MODEL", "bin": "" },
+    "opencode": { "model": "$GOBLIN_OPENCODE_DEFAULT_MODEL", "bin": "" }
   },
   "providerFallback": [],
   "timeoutSecs": 900,

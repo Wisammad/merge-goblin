@@ -2,7 +2,7 @@
 # providers.sh — the provider registry. The engine talks only to this file, so
 # adding a new AI CLI means dropping one adapter into lib/providers/.
 
-GOBLIN_PROVIDERS="claude codex cursor"
+GOBLIN_PROVIDERS="claude codex cursor opencode"
 
 providers_load() {
   local p
@@ -22,7 +22,7 @@ provider_classify_error() {
     # A spend cap is a quota. Codex words it "You hit your spend cap set by the
     # owner of your workspace. Ask an owner to increase your spend cap", which
     # matched none of the above and landed in `other`.
-    *"spend cap"*|*"spending limit"*|*"billing"*|*"credit balance"*|*"insufficient funds"*) echo quota ;;
+    *"spend cap"*|*"spending limit"*|*"billing"*|*"credit balance"*|*"insufficient funds"*|*"insufficient account funds"*) echo quota ;;
     *"not logged in"*|*"unauthorized"*|*"authentication"*|*"invalid api key"*|*401*) echo auth ;;
     *"hastrustdialogaccepted"*|*"workspace has not been trusted"*|*"not been trusted"*) echo setup ;;
     *"timeout"*|*"timed out"*|*"econnreset"*|*"network"*|*"socket"*|*5[0-9][0-9]*) echo transient ;;

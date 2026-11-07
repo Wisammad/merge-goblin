@@ -54,7 +54,7 @@ _panel_model() {
 }
 
 _panel_provider() {
-  case "$1" in claude|codex|cursor) printf '%s' "$1" ;; *) return 1 ;; esac
+  case "$1" in claude|codex|cursor|opencode) printf '%s' "$1" ;; *) return 1 ;; esac
 }
 
 cmd_panel() {

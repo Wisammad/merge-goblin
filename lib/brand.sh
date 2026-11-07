@@ -35,6 +35,11 @@ GOBLIN_MARKER_NS_LEGACY="bob"
 # opaque provider error, so this changes only against that list.
 GOBLIN_CURSOR_DEFAULT_MODEL="cursor-grok-4.6-high"
 
+# The model the OpenCode adapter reviews with when none is configured. Free, and per
+# opencode.ai/docs/zen its provider keeps no data and does not train on it. A paid
+# Zen model (e.g. opencode/deepseek-v4.1-flash) needs credits on the account.
+GOBLIN_OPENCODE_DEFAULT_MODEL="opencode/deepseek-v4.1-flash-free"
+
 # Severity vocabulary. The order here IS the display/sort order.
 GOBLIN_SEVERITIES="blocker convention risk nit question"
 

@@ -2,9 +2,12 @@
 # reviewers.sh — detect the coding agent, run independent reviewers in parallel,
 # and merge their normalized findings into one review.
 
+# The reviewer list (GOBLIN_PROVIDERS) lives in the provider registry.
+. "$(dirname "${BASH_SOURCE[0]}")/providers.sh"
+
 reviewer_label() {
   case "$1" in claude) printf 'Claude' ;; codex) printf 'OpenAI Codex' ;;
-    cursor) printf 'Cursor' ;; *) printf '%s' "$1" ;; esac
+    cursor) printf 'Cursor' ;; opencode) printf 'OpenCode' ;; *) printf '%s' "$1" ;; esac
 }
 
 # reviewers_plan <evidence.txt> <out.json>
@@ -19,11 +22,12 @@ reviewers_plan() {
   local contributors="" independent="" best="" best_n=0 signal=""
   local counts='{}' sigs='[]'
 
-  for p in claude codex cursor; do
+  for p in $GOBLIN_PROVIDERS; do
     case "$p" in
       claude) pattern='co-authored-by:.*(claude|anthropic)|noreply@anthropic\.com|generated (with|by).*claude|claude code' ;;
       codex)  pattern='co-authored-by:.*(codex|openai)|noreply@openai\.com|generated (with|by).*codex|written by codex' ;;
       cursor) pattern='co-authored-by:.*cursor|cursor(agent)?@|generated (with|by).*cursor|made with cursor' ;;
+      opencode) pattern='co-authored-by:.*opencode|generated (with|by).*opencode|opencode\.ai' ;;
     esac
     n="$(grep -Eic "$pattern" "$evidence" 2>/dev/null || true)"; n="${n:-0}"
     counts="$(printf '%s' "$counts" | jq -c --arg p "$p" --argjson n "$n" '. + {($p):$n}')"
@@ -55,7 +59,7 @@ reviewers_plan() {
   # "every agent contributed" fallback below already does.
   local n_ind_raw=0; for p in $independent; do n_ind_raw=$((n_ind_raw + 1)); done
   local avail="" probe
-  for p in claude codex cursor; do
+  for p in $GOBLIN_PROVIDERS; do
     command -v "provider_${p}_probe" >/dev/null 2>&1 || continue
     probe="$("provider_${p}_probe" 2>/dev/null)"
     [ "$(printf '%s' "$probe" | jq -r '.available and .authed' 2>/dev/null)" = true ] \
@@ -195,7 +199,7 @@ reviewer_checkout() {
 # Installed and signed in right now — not whether a subscription still has quota.
 reviewers_available() {
   local p probe avail=""
-  for p in claude codex cursor; do
+  for p in $GOBLIN_PROVIDERS; do
     command -v "provider_${p}_probe" >/dev/null 2>&1 || continue
     probe="$("provider_${p}_probe" 2>/dev/null)"
     [ "$(printf '%s' "$probe" | jq -r '.available and .authed' 2>/dev/null)" = true ] \
@@ -221,7 +225,7 @@ reviewers_spare_list() {
   local avail fallbacks ordered="" p pp
   avail="$(reviewers_available)"
   fallbacks="$(cfg_read | jq -r '.providerFallback[]?' 2>/dev/null)"
-  for pp in $fallbacks claude codex cursor; do
+  for pp in $fallbacks $GOBLIN_PROVIDERS; do
     case " $ordered " in *" $pp "*) continue ;; esac
     case " $avail " in *" $pp "*) ;; *) continue ;; esac
     case " $tried " in *" $pp "*) continue ;; esac

@@ -146,7 +146,7 @@ doctor_providers() {
 
   if [ "${ready:-0}" -eq 0 ]; then
     _doc fail "ai provider" "none installed and authenticated" \
-      "install one: claude (claude.ai/code) · codex (npm i -g @openai/codex) · cursor (curl https://cursor.com/install -fsS | bash)"
+      "install one: claude (claude.ai/code) · codex (npm i -g @openai/codex) · cursor (curl https://cursor.com/install -fsS | bash) · opencode (curl -fsSL https://opencode.ai/install | bash)"
     return
   fi
 

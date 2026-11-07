@@ -56,7 +56,7 @@ enum VerdictMode: String, CaseIterable {
 }
 
 enum ProviderId: String, CaseIterable {
-    case claude, codex, cursor
+    case claude, codex, cursor, opencode
 }
 
 enum AgentAction: String, CaseIterable {
