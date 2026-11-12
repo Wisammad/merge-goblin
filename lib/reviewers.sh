@@ -324,7 +324,7 @@ reviewers_merge() {
   # assigned, so $work here was the CALLER's $work, not the argument.
   local merged="$work/merged-stage.json"
   jq '. + {results:[]}' "$plan" > "$final"
-  printf '{"schema_version":1,"summary":"","suggested_verdict":"comment","intent_notes":[],"findings":[]}' > "$merged"
+  printf '{"schema_version":1,"summary":"","suggested_verdict":"comment","intent_notes":[],"findings":[],"fixed_prior":[]}' > "$merged"
 
   local meta norm ok
   for p in $(jq -r '.reviewers[].provider' "$plan"); do
@@ -353,6 +353,7 @@ reviewers_merge() {
         + "\n\n" + ($r[0].summary // "")
       | .findings += [ $r[0].findings[]? + {reviewer:$p, reviewerModel:($m[0].model // $p)} ]
       | .intent_notes += [($r[0].intent_note // empty) + {reviewer:$p}]
+      | .fixed_prior = (.fixed_prior + ($r[0].fixed_prior // []) | unique)
     ' "$merged" > "$merged.next" && mv "$merged.next" "$merged"
   done
 

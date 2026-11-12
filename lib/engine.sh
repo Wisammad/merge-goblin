@@ -953,15 +953,26 @@ engine_review_pr() {
   gh_ticket_context "$slug" "$pr" "$work/pr.json" "$work/ticket.txt" >/dev/null
   : > "$work/prior.txt"
   local prior_json="$work/prior.json"; echo '[]' > "$prior_json"
-  if [ -n "$last_sha" ] && [ "$(cfg_get '.incrementalReview' true)" = "true" ]; then
-    gh_prior_findings "$slug" "$pr" > "$prior_json" 2>/dev/null || echo '[]' > "$prior_json"
+  if [ -n "$last_sha" ]; then
+    # Without these, the pass would post every earlier finding again: stop instead.
+    if ! gh_prior_findings "$slug" "$pr" > "$prior_json"; then
+      log "  #$pr: could not read the findings already posted on this PR"
+      [ "$DRY_RUN" != true ] && gh_status "$slug" "$head" error "could not read earlier findings"
+      engine_pass_write "could not read the findings already posted on this PR"
+      rm -rf "$work"; return 1
+    fi
+    # Incremental review off re-raises what was posted, but never what was DECLINED.
+    if [ "$(cfg_get '.incrementalReview' true)" != "true" ]; then
+      jq '[.[] | select(.declined == true)]' "$prior_json" > "$prior_json.tmp" && mv "$prior_json.tmp" "$prior_json"
+    fi
     jq -r 'def one: tostring | gsub("[\\n\\r`]+"; " ") | .[0:200];
       (map(select(.declined == true)) + map(select(.declined != true)))[]
-      | "- \(.severity // "?" | one): \(.path // "?" | one):\(.line // "?" | one)"
+      | "- " + (if (.id // "" | tostring | test("^[0-9a-f]{6,64}$")) then "[\(.id)] " else "" end)
+        + "\(.severity // "?" | one): \(.path // "?" | one):\(.line // "?" | one)"
         + (if (.title // "") != "" then " — \(.title | one)" else "" end)
         + (if .declined == true then " — DECLINED (\(.declinedHow // "declined" | one)), do not raise again" else "" end)' \
       "$prior_json" > "$work/prior.txt" 2>/dev/null
-    log "  #$pr: incremental (last reviewed $(trunc "$last_sha" 7), $(jq 'length' "$prior_json") prior finding(s), $(jq '[.[] | select(.declined)] | length' "$prior_json") declined)"
+    log "  #$pr: prior findings (last reviewed $(trunc "$last_sha" 7), $(jq 'length' "$prior_json") prior finding(s), $(jq '[.[] | select(.declined)] | length' "$prior_json") declined)"
   fi
 
   # 4. assemble the prompt from THIS repo's own review rules
@@ -1071,17 +1082,16 @@ engine_publish() {
     post_intent "$slug" "$pr" "$work/intent.md"
   fi
 
-  # tell prior threads that their finding is gone
+  # tell prior threads that their finding is fixed
   #
-  # "Gone" is only meaningful if the code MOVED. A re-review of the SAME commit —
-  # which every --force re-run is, and every sweep pass after the first —
-  # deliberately drops the findings already posted before it reaches here, so
-  # each of those threads looks resolved and would be told "no longer flagged"
-  # about a bug still sitting on that exact line. No new commit, nothing fixed.
+  # Only the ids a reviewer positively listed in fixed_prior: the prompt says not to
+  # repeat a finding that still stands, so absence from this review means nothing.
+  # And only when the code MOVED: a re-review of the SAME commit (every --force
+  # re-run, every sweep pass after the first) cannot have fixed anything.
   if [ -s "$prior_json" ] && [ "$(jq 'length' "$prior_json")" != "0" ] \
      && [ "$last_sha" != "$head" ]; then
-    jq -c '[.findings[].id]' "$work/norm.json" > "$work/curids.json"
-    post_fixed_replies "$slug" "$pr" "$prior_json" "$work/curids.json" "$head"
+    jq -c '.fixed_prior // []' "$work/norm.json" > "$work/fixedids.json"
+    post_fixed_replies "$slug" "$pr" "$prior_json" "$work/fixedids.json" "$head"
   fi
 
   local counts inline_n

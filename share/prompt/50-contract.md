@@ -20,6 +20,7 @@ fence around it.
       "suggestion": "optional replacement code for exactly those lines"
     }
   ],
+  "fixed_prior": ["a23f9e0f2eda"],
   "intent_note": {
     "issue": "TICKET-123",
     "verdict": "fulfils" | "partial" | "diverges" | "unknown" | "no_ticket",
@@ -48,6 +49,11 @@ in the diff below:
 | `risk` | plausible problem you could not fully verify |
 | `nit` | minor; only if it breaks a required standard |
 | `question` | genuinely needs the author to answer |
+
+**`fixed_prior`** lists the ids of findings from "Findings already posted" that the
+current code has fixed. Check the code for each one before you list it: the author is
+told it is fixed. Leave out anything still present, anything you could not check, and
+anything declined. An empty list when there was nothing posted before.
 
 **`suggestion`** must be the exact replacement text for the commented line range —
 omit it unless it applies cleanly on its own.
