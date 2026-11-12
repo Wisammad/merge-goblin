@@ -350,6 +350,45 @@ test_normalize_drops_inverted_range() {
   teardown
 }
 
+test_prior_findings_declines() {
+  local c='{"id":1,"path":"a","line":1,"user":{"login":"g","type":"User"},"body":"<!-- goblin:finding {\"id\":\"x\"} --> **T**"}'
+  local r out=""
+  for r in "not a false positive, the input is invalid" "isn't a false positive" "we will not fix this" "won't fix" \
+           "Is this intentional?" "this isn't a bug" "by design|you're right, will fix" "will fix|actually, by design" ""; do
+    out="$out$(jq -nc --argjson c "$c" --arg r "$r" '[$c] + ($r | split("|") | to_entries
+        | map({id: (.key + 2), in_reply_to_id: 1, user: {login: "h", type: "User"}, body: .value}))' \
+      | jq -c -f "$ROOT/share/jq/prior-findings.jq" | jq -r '.[0].declined') "
+  done
+  eq "false false true true false true false true false " "$out"
+}
+
+test_fixed_prior_is_kept_and_merged() (
+  setup
+  . "$ROOT/lib/reviewers.sh"
+  eq '["a23f9e0f2eda"]' "$(echo '{"summary":"s","findings":[],"fixed_prior":["a23f9e0f2eda","bad id; rm",7,"a23f9e0f2eda"]}' \
+    | jq -c --argjson max 25 -f "$ROOT/share/jq/normalize.jq" | jq -c .fixed_prior)" || return 1
+  eq '[]' "$(echo '{"summary":"s","findings":[]}' | jq -c --argjson max 25 -f "$ROOT/share/jq/normalize.jq" | jq -c .fixed_prior)" || return 1
+  jq -e '.required | index("fixed_prior")' "$ROOT/share/schema/findings.strict.schema.json" >/dev/null || return 1
+  local w="$GOBLIN_HOME/w"; mkdir -p "$w"
+  echo '{"independent":true,"reviewers":[{"provider":"codex"},{"provider":"cursor"}]}' > "$w/plan.json"
+  echo '{"ok":true}' > "$w/meta-codex.json"; echo '{"ok":true}' > "$w/meta-cursor.json"
+  echo '{"summary":"s","findings":[],"fixed_prior":["aaaaaa"]}' > "$w/norm-codex.json"
+  echo '{"summary":"s","findings":[],"fixed_prior":["bbbbbb","aaaaaa"]}' > "$w/norm-cursor.json"
+  reviewers_merge "$w/plan.json" "$w" "$w/out.json" "$w/final.json" >/dev/null 2>&1
+  eq '["aaaaaa","bbbbbb"]' "$(jq -c .fixed_prior "$w/out.json")"
+)
+
+test_fixed_replies_only_for_listed_ids() (
+  setup
+  . "$ROOT/lib/post.sh"
+  export GH_FAKE_LOG="$GOBLIN_HOME/gh.log"; : > "$GH_FAKE_LOG"
+  echo '[{"id":"aaaaaa","commentId":11},{"id":"bbbbbb","commentId":12,"declined":true},
+         {"id":"cccccc","commentId":13,"fixedReplied":true},{"id":"dddddd","commentId":14}]' > "$GOBLIN_HOME/prior.json"
+  echo '["aaaaaa","bbbbbb","cccccc"]' > "$GOBLIN_HOME/fixed.json"
+  post_fixed_replies o/r 5 "$GOBLIN_HOME/prior.json" "$GOBLIN_HOME/fixed.json" 0123456789
+  eq "comments/11/replies" "$(grep -o 'comments/[0-9]*/replies' "$GH_FAKE_LOG" | tr '\n' ' ' | sed 's/ $//')"
+)
+
 test_normalize_coerces_verdict_synonyms() {
   # Regression: Grok 4.5 returns intent verdict "matches" and suggested_verdict
   # "approve" where the contract says "fulfils". validate.jq used to hard-fail
@@ -2034,11 +2073,10 @@ test_pass_result_is_written_only_when_asked() (
 )
 
 test_no_fixed_replies_without_a_new_commit() {
-  # A re-review of the SAME commit drops every finding already posted before it
-  # reaches post_fixed_replies, so all of those threads look resolved. Replying
-  # "no longer flagged" there marks live bugs as fixed — and a sweep would do it
-  # on every pass. The guard is the head having actually changed.
-  grep -B14 -F 'post_fixed_replies "$slug" "$pr" "$prior_json" "$work/curids.json" "$head"' \
+  # A re-review of the SAME commit cannot have fixed anything, so a reviewer listing
+  # an id in fixed_prior there is wrong, and "no longer flagged" would mark a live bug
+  # as fixed, on every pass of a sweep. The guard is the head having actually changed.
+  grep -B14 -F 'post_fixed_replies "$slug" "$pr" "$prior_json" "$work/fixedids.json" "$head"' \
     "$ROOT/lib/engine.sh" | grep -qF '[ "$last_sha" != "$head" ]' \
     || { echo "fixed-replies are not gated on the commit changing"; return 1; }
   # And last_sha has to actually reach engine_publish, or the guard reads an
@@ -2872,6 +2910,9 @@ t "findings: normalize sort/dedupe"      test_normalize_sorts_dedupes_caps
 t "findings: verdict synonyms coerced"   test_normalize_coerces_verdict_synonyms
 t "findings: validate allows verdict words" test_validate_no_longer_gates_verdict_words
 t "findings: drop inverted range"        test_normalize_drops_inverted_range
+t "prior findings: decline phrases"      test_prior_findings_declines
+t "fixed: kept, merged across reviewers" test_fixed_prior_is_kept_and_merged
+t "fixed: reply only for listed ids"     test_fixed_replies_only_for_listed_ids
 t "findings: verdict clamped"            test_verdict_is_clamped_to_comment
 t "findings: extract from prose"         test_findings_extract_from_fenced_prose
 t "findings: prose on the same line"     test_findings_extract_prose_on_same_line

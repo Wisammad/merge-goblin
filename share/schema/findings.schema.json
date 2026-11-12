@@ -40,6 +40,11 @@
         }
       }
     },
+    "fixed_prior": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ids (in [brackets]) from 'Findings already posted' that the current code has FIXED. Only an id you checked in the code; leave out anything unsure or still present. Empty when there were none."
+    },
     "intent_note": {
       "type": ["object", "null"],
       "description": "Does the PR do what its linked issue asked? Null when there is no linked issue.",

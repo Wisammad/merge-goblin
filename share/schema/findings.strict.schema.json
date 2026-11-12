@@ -4,7 +4,7 @@
   "description": "Same contract as findings.schema.json, in OpenAI structured-output dialect: every property must appear in `required`, so optional fields are expressed as nullable unions instead. Used by providers that enforce that dialect (codex).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "summary", "suggested_verdict", "findings", "intent_note"],
+  "required": ["schema_version", "summary", "suggested_verdict", "findings", "intent_note", "fixed_prior"],
   "properties": {
     "schema_version": { "type": "integer" },
     "summary": { "type": "string" },
@@ -28,6 +28,7 @@
         }
       }
     },
+    "fixed_prior": { "type": "array", "items": { "type": "string" } },
     "intent_note": {
       "type": ["object", "null"],
       "additionalProperties": false,

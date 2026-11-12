@@ -122,15 +122,19 @@ post_intent() {
   fi
 }
 
-# post_fixed_replies <slug> <pr> <prior.json> <current-ids.json> <head>
-# Reply on threads whose finding is gone from the new run. Replies are comment
-# replies, not review events, so they don't recreate the multi-event spam.
+# post_fixed_replies <slug> <pr> <prior.json> <fixed-ids.json> <head>
+# Replies only on prior findings whose id a reviewer listed in fixed_prior, once per
+# thread, never on a declined one. Replies are comment replies, not review events,
+# so they don't recreate the multi-event spam.
 post_fixed_replies() {
-  local slug="$1" pr="$2" prior="$3" curids="$4" head="$5"
+  local slug="$1" pr="$2" prior="$3" fixedids="$4" head="$5"
   local gone i n cid
-  gone="$(jq -c --slurpfile cur "$curids" \
-    '[ .[] | select(.id != null) | select(($cur[0] | index(.id)) == null) ] | .[0:10]' \
-    "$prior" 2>/dev/null)"
+  # `.id as $i` is load-bearing: `$fx[0] | index(.id)` evaluates `.id` against the ids
+  # ARRAY, a jq error, and selected nothing, silently: no reply was ever posted.
+  gone="$(jq -c --slurpfile fx "$fixedids" \
+    '[ .[] | select(.id != null and .declined != true and .fixedReplied != true)
+       | select(.id as $i | ($fx[0] | index($i)) != null) ] | .[0:10]' \
+    "$prior")"
   n="$(printf '%s' "$gone" | jq 'length' 2>/dev/null || echo 0)"
   i=0
   while [ "$i" -lt "${n:-0}" ]; do
