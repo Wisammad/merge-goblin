@@ -168,17 +168,27 @@ gh_human_reviewers() {
     | unique | .[]' "$1" 2>/dev/null
 }
 
-# gh_prior_findings <slug> <pr> — ids/titles already posted inline, for dedupe.
+# gh_prior_findings <slug> <pr> — findings already posted inline, for dedupe, and
+# which of them were declined (prior-findings.jq says how). One array: `--paginate
+# --jq` ran the filter per page, so past 100 comments only page one was deduped.
 # `.line` can be null on outdated comments (only the deprecated `position`
 # survives), so fall back to original_line.
 gh_prior_findings() {
-  gh api --paginate "repos/$1/pulls/$2/comments?per_page=100" --jq '
-    [ .[]
-      | . as $c
-      | select(.body != null)
-      | (.body | capture("<!-- (?<ns>'"$GOBLIN_MARKER_NS"'|'"$GOBLIN_MARKER_NS_LEGACY"'):finding (?<j>\\{.*?\\}) -->") // empty) as $mk
-      | ($mk.j | fromjson)
-        + { commentId: $c.id, path: $c.path, line: ($c.line // $c.original_line) } ]' 2>/dev/null
+  local all resolved
+  all="$(gh api --paginate --slurp "repos/$1/pulls/$2/comments?per_page=100")" || return 1
+  resolved="$(gh_resolved_thread_roots "$1" "$2")" || return 1
+  printf '%s' "$all" | jq -c 'add // []' | jq -c --arg ns "$GOBLIN_MARKER_NS" --arg legacy "$GOBLIN_MARKER_NS_LEGACY" \
+    --argjson resolved "$resolved" -f "$SHARE_DIR/jq/prior-findings.jq"
+}
+
+# gh_resolved_thread_roots <slug> <pr> — REST ids of the first comment of every
+# resolved review thread, as a JSON array. Threads come 100 per GraphQL page.
+GH_RESOLVED_QUERY='query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{isResolved comments(first:1){nodes{databaseId}}}}}}}'
+gh_resolved_thread_roots() {
+  gh api graphql --paginate --slurp -f query="$GH_RESOLVED_QUERY" \
+    -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" |
+    jq -c '[ .[].data.repository.pullRequest.reviewThreads.nodes[]
+             | select(.isResolved) | .comments.nodes[0].databaseId ]'
 }
 
 # gh_find_comment <slug> <pr> <marker-type> — id of an existing comment, for upsert.
@@ -220,6 +230,12 @@ gh_ticket_context() {
 gh_status() {
   [ "$(cfg_get '.postCommitStatus' true)" = "true" ] || return 0
   local slug="$1" sha="$2" state="$3" desc="$4" url="${5:-}"
+  # GitHub refuses a 4-byte character in a status description (422) and the error is
+  # swallowed below, so counts starting with 🔴/🟡 left the check pending forever
+  # (#3429). Drop the emoji, and the BMP symbols that would look orphaned; keep the words.
+  desc="$(printf '%s' "$desc" | jq -Rr 'explode
+      | map(select(. < 65536 and (. < 9728 or . > 10175) and . != 65039))
+      | implode | gsub(" {2,}"; " ") | ltrimstr(" ")')"
   set -- -f state="$state" -f context="$GOBLIN_SLUG/review" -f description="$(trunc "$desc" 138)"
   [ -n "$url" ] && set -- "$@" -f target_url="$url"
   gh api -X POST "repos/$slug/statuses/$sha" "$@" --silent >/dev/null 2>&1 || true

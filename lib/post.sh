@@ -129,7 +129,7 @@ post_fixed_replies() {
   local slug="$1" pr="$2" prior="$3" curids="$4" head="$5"
   local gone i n cid
   gone="$(jq -c --slurpfile cur "$curids" \
-    '[ .[] | select(.id != null) | select(($cur[0] | index(.id)) == null) ] | .[0:10]' \
+    '[ .[] | select(.id != null and .declined != true) | select(($cur[0] | index(.id)) == null) ] | .[0:10]' \
     "$prior" 2>/dev/null)"
   n="$(printf '%s' "$gone" | jq 'length' 2>/dev/null || echo 0)"
   i=0

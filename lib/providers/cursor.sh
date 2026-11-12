@@ -59,10 +59,10 @@ provider_cursor_probe() {
 provider_cursor_invoke() {
   local bin="$1" dir="$2" pf="$3" raw="$4" model="${5:-}" rc=0
   # cursor-agent refuses to run in an untrusted directory and asks interactively,
-  # which never completes under launchd. --force trusts the directory; safe here
-  # because the review needs read access only — it has no tools to post with and
-  # the repo is a throwaway scratch clone.
-  set -- -p --output-format json --force
+  # which never completes under launchd, so --trust trusts the scratch clone.
+  # --mode ask is its read-only mode: it reads the checkout but cannot edit it or run
+  # commands. --force ("allow commands") handed a model reading the PR a shell.
+  set -- -p --output-format json --mode ask --trust
   [ -n "$model" ] && set -- "$@" --model "$model"
 
   ( cd "$dir" 2>/dev/null || exit 1

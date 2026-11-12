@@ -955,8 +955,13 @@ engine_review_pr() {
   local prior_json="$work/prior.json"; echo '[]' > "$prior_json"
   if [ -n "$last_sha" ] && [ "$(cfg_get '.incrementalReview' true)" = "true" ]; then
     gh_prior_findings "$slug" "$pr" > "$prior_json" 2>/dev/null || echo '[]' > "$prior_json"
-    jq -r '.[] | "- \(.severity // "?"): \(.path // "?"):\(.line // "?")"' "$prior_json" > "$work/prior.txt" 2>/dev/null
-    log "  #$pr: incremental (last reviewed $(trunc "$last_sha" 7), $(jq 'length' "$prior_json") prior finding(s))"
+    jq -r 'def one: tostring | gsub("[\\n\\r`]+"; " ") | .[0:200];
+      (map(select(.declined == true)) + map(select(.declined != true)))[]
+      | "- \(.severity // "?" | one): \(.path // "?" | one):\(.line // "?" | one)"
+        + (if (.title // "") != "" then " — \(.title | one)" else "" end)
+        + (if .declined == true then " — DECLINED (\(.declinedHow // "declined" | one)), do not raise again" else "" end)' \
+      "$prior_json" > "$work/prior.txt" 2>/dev/null
+    log "  #$pr: incremental (last reviewed $(trunc "$last_sha" 7), $(jq 'length' "$prior_json") prior finding(s), $(jq '[.[] | select(.declined)] | length' "$prior_json") declined)"
   fi
 
   # 4. assemble the prompt from THIS repo's own review rules
@@ -1257,8 +1262,11 @@ engine_checkout() {
     log "  fetch failed in $dir: $(head -c 200 "$ferr" 2>/dev/null)"
     rm -f "$ferr"; return 1
   fi
-  if ! ( cd "$dir" && gh pr checkout "$pr" --repo "$slug" --detach 2>"$ferr" ); then
-    log "  gh pr checkout $pr failed: $(head -c 200 "$ferr" 2>/dev/null)"
+  # refs/pull/N/head outlives the branch (deleted on merge) and covers fork PRs;
+  # `gh pr checkout` goes by branch name and failed on exactly those.
+  if ! { git -C "$dir" fetch --quiet origin "pull/$pr/head" 2>"$ferr" \
+         && git -C "$dir" checkout --quiet --detach FETCH_HEAD 2>"$ferr"; }; then
+    log "  checkout of pull/$pr/head failed: $(head -c 200 "$ferr" 2>/dev/null)"
     rm -f "$ferr"; return 1
   fi
   rm -f "$ferr"
